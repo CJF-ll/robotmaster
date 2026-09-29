@@ -1,0 +1,4 @@
+build/
+output/
+data/*.mp4
+*.bak
