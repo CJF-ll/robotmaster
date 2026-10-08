@@ -1,0 +1,105 @@
+#pragma once
+
+#include <deque>
+#include <optional>
+#include <vector>
+
+#include "config.hpp"
+#include "types.hpp"
+
+struct AffineGeometry {
+  cv::Point2d center{};
+  cv::Point2d axis_cos{};
+  cv::Point2d axis_sin{};
+  double armor_width_scale = 0.26;
+  double armor_height_px = 18.0;
+  int calibration_samples = 0;
+  double calibration_rms_px = 0.0;
+
+  cv::Point2d point(double phase) const;
+  cv::Point2d tangent(double phase) const;
+  double phase_of(const cv::Point2d& point) const;
+};
+
+struct MotionPrior {
+  bool valid = false;
+  double speed_abs_rad_s = 0.0;
+  int phase_direction_sign = 0;
+  int repeat_period_frames = 0;
+  int detected_motion_start_frame = -1;
+  int detected_motion_end_frame = -1;
+};
+
+AffineGeometry calibrate_affine_geometry(const std::vector<ArmorObservation>& samples,
+                                         const Config& config, cv::Size image_size);
+
+class PhaseQuadModel {
+ public:
+  bool valid() const { return valid_; }
+  int bin_count() const { return static_cast<int>(bins_.size()); }
+  int covered_bins() const { return covered_bins_; }
+  ProjectedArmor project(int id, double phase, const AffineGeometry& geometry,
+                         const cv::Point2d& model_offset) const;
+
+ private:
+  struct Bin {
+    cv::Point2d center_residual{};
+    std::array<cv::Point2d, 4> corner_offsets{};
+  };
+  bool valid_ = false;
+  int covered_bins_ = 0;
+  std::vector<Bin> bins_;
+
+  friend PhaseQuadModel calibrate_phase_quad_model(
+      const std::vector<ArmorObservation>&, const AffineGeometry&, const Config&);
+};
+
+PhaseQuadModel calibrate_phase_quad_model(const std::vector<ArmorObservation>& samples,
+                                          const AffineGeometry& geometry,
+                                          const Config& config);
+
+class RigidArmorSolver {
+ public:
+  RigidArmorSolver(const Config& config, AffineGeometry geometry,
+                   PhaseQuadModel phase_quad_model, MotionPrior motion_prior);
+  SolverOutput update(const std::vector<ArmorObservation>& observations, double timestamp_s,
+                      bool scene_moving);
+
+ private:
+  Config config_;
+  AffineGeometry geometry_;
+  PhaseQuadModel phase_quad_model_;
+  MotionPrior motion_prior_;
+  cv::Point2d model_offset_{};
+  bool initialized_ = false;
+  double last_timestamp_s_ = 0.0;
+  double phase_ = 0.0, speed_ = 0.0, acceleration_ = 0.0;
+  double previous_speed_ = 0.0;
+  int missed_frames_ = 0;
+  MotionMode committed_mode_ = MotionMode::kInitializing;
+  MotionMode pending_mode_ = MotionMode::kInitializing;
+  int pending_mode_frames_ = 0;
+  bool scene_moving_ = false;
+  bool detection_history_valid_ = false;
+  ArmorObservation previous_detection_{};
+  double previous_detection_time_s_ = 0.0;
+  cv::Point2d detection_velocity_px_s_{};
+  bool detection_velocity_valid_ = false;
+  struct DetectionSample {
+    double time_s = 0.0;
+    cv::Point2d center{};
+  };
+  std::deque<DetectionSample> detection_history_;
+  int display_candidate_slot_ = -1;
+  struct JumpTransition {
+    ArmorObservation exit;
+    ArmorObservation entry;
+  };
+  std::deque<JumpTransition> jump_transitions_;
+  struct PhaseSample { double time = 0.0; double phase = 0.0; };
+  std::deque<PhaseSample> phase_samples_;
+
+  std::array<ProjectedArmor, 3> project_all(double base_phase) const;
+  MotionMode classify_mode(double dt);
+  double robust_phase_slope() const;
+};
