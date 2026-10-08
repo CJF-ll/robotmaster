@@ -1,0 +1,290 @@
+#include <array>
+#include <cmath>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <opencv2/imgproc.hpp>
+
+#include "armor_detector.hpp"
+#include "rigid_model.hpp"
+
+namespace {
+constexpr double kTwoPi = 2.0 * CV_PI;
+
+void expect(bool condition, const std::string& message) {
+  if (!condition) throw std::runtime_error(message);
+}
+
+LightBar make_light(cv::Point2f center, float length, float width,
+                    float angle_from_vertical_deg) {
+  LightBar light;
+  light.rect = cv::RotatedRect(center, {width, length}, angle_from_vertical_deg);
+  light.length = length;
+  light.width = width;
+  light.long_axis_angle_deg = 90.0F + angle_from_vertical_deg;
+  light.area = length * width;
+  return light;
+}
+
+std::vector<cv::Point2f> polygon(const std::array<cv::Point2f, 4>& corners) {
+  return {corners.begin(), corners.end()};
+}
+
+void expect_light_inside(const ArmorObservation& armor, const LightBar& light) {
+  cv::Point2f vertices[4];
+  light.rect.points(vertices);
+  const auto contour = polygon(armor.corners);
+  for (const auto& vertex : vertices) {
+    expect(cv::pointPolygonTest(contour, vertex, true) >= -1.1,
+           "observed quadrilateral does not contain a light band");
+  }
+}
+
+void test_light_band_quad() {
+  Config config;
+  const auto rectangle = build_armor_observation(
+      make_light({80, 100}, 20, 4, 0), make_light({120, 100}, 20, 4, 0),
+      config, {200, 200});
+  expect(rectangle.has_value(), "parallel light bands should form an armor quad");
+  expect(cv::isContourConvex(polygon(rectangle->corners)),
+         "parallel light-band quad must be convex");
+  expect(std::abs(rectangle->center.x - 100.0F) < 0.1F &&
+             std::abs(rectangle->center.y - 100.0F) < 0.1F,
+         "armor center should remain the mean of the two light centers");
+  expect_light_inside(*rectangle, make_light({80, 100}, 20, 4, 0));
+  expect_light_inside(*rectangle, make_light({120, 100}, 20, 4, 0));
+
+  const LightBar left = make_light({78, 99}, 24, 5, -9);
+  const LightBar right = make_light({122, 104}, 18, 3, 11);
+  const auto trapezoid = build_armor_observation(left, right, config, {220, 220});
+  expect(trapezoid.has_value(), "perspective light bands should form a trapezoid");
+  expect(cv::isContourConvex(polygon(trapezoid->corners)),
+         "perspective light-band quad must be convex");
+  expect_light_inside(*trapezoid, left);
+  expect_light_inside(*trapezoid, right);
+  cv::Point2f left_side = trapezoid->corners[3] - trapezoid->corners[0];
+  cv::Point2f right_side = trapezoid->corners[2] - trapezoid->corners[1];
+  left_side *= 1.0F / static_cast<float>(cv::norm(left_side));
+  right_side *= 1.0F / static_cast<float>(cv::norm(right_side));
+  const float side_cross = std::abs(left_side.x * right_side.y - left_side.y * right_side.x);
+  expect(side_cross > 0.10F,
+         "different light tilts should not be forced into parallel rectangle sides");
+}
+
+void test_single_light_is_not_full_armor() {
+  Config config;
+  config.roi_x_min = 0; config.roi_y_min = 0;
+  config.roi_x_max = 1; config.roi_y_max = 1;
+  cv::Mat image(180, 180, CV_8UC3, cv::Scalar::all(0));
+  const cv::RotatedRect light({90, 90}, {5, 24}, 8);
+  cv::Point2f raw[4]; light.points(raw);
+  std::vector<cv::Point> vertices;
+  for (const auto& point : raw) vertices.emplace_back(cvRound(point.x), cvRound(point.y));
+  cv::fillConvexPoly(image, vertices, cv::Scalar(0, 0, 255));
+  const DetectionFrame detected = ArmorDetector(config).detect(image);
+  expect(detected.armors.empty(), "a single light band must not become a full red armor box");
+}
+
+std::vector<ArmorObservation> synthetic_phase_samples(const AffineGeometry& geometry) {
+  std::vector<ArmorObservation> samples;
+  for (int i = 0; i < 72; ++i) {
+    const double phase = kTwoPi * i / 72.0;
+    const cv::Point2d center = geometry.point(phase);
+    const float width = static_cast<float>(28.0 + 8.0 * std::cos(phase));
+    const float height = static_cast<float>(16.0 + 2.0 * std::sin(phase));
+    const float shear = static_cast<float>(3.0 * std::sin(phase));
+    ArmorObservation sample;
+    sample.center = center;
+    sample.corners = {
+        sample.center + cv::Point2f(-0.5F * width + shear, -0.5F * height),
+        sample.center + cv::Point2f(0.5F * width + shear, -0.5F * height),
+        sample.center + cv::Point2f(0.5F * width - shear, 0.5F * height),
+        sample.center + cv::Point2f(-0.5F * width - shear, 0.5F * height)};
+    sample.size = {width, height};
+    sample.score = 1.0F;
+    samples.push_back(sample);
+  }
+  return samples;
+}
+
+ArmorObservation translated_observation(const ArmorObservation& source,
+                                        cv::Point2f translation) {
+  ArmorObservation translated = source;
+  translated.center += translation;
+  for (auto& corner : translated.corners) corner += translation;
+  return translated;
+}
+
+void test_robust_image_velocity_prediction() {
+  Config config;
+  config.shape_phase_bins = 36;
+  config.shape_min_samples_per_bin = 1;
+  config.shape_min_covered_bins = 12;
+  config.shape_smoothing_radius_bins = 2;
+  config.max_observation_distance_px = 1000.0;
+  config.max_phase_innovation_deg = 180.0;
+  config.prediction_lead_frames = 3;
+  config.prediction_lead_s = 0.10;
+  config.image_prediction_window_frames = 5;
+  config.image_prediction_min_samples = 3;
+  config.image_prediction_velocity_gain = 1.0;
+  config.image_prediction_max_step_px = 30.0;
+  config.image_prediction_jump_min_px = 60.0;
+
+  AffineGeometry geometry;
+  geometry.center = {100, 90};
+  geometry.axis_cos = {42, 0};
+  geometry.axis_sin = {0, 24};
+  const auto phase_samples = synthetic_phase_samples(geometry);
+  const PhaseQuadModel shape = calibrate_phase_quad_model(phase_samples, geometry, config);
+  expect(shape.valid(), "robust image prediction test needs a valid phase model");
+
+  MotionPrior prior;
+  prior.valid = true;
+  prior.speed_abs_rad_s = 1.0;
+  prior.phase_direction_sign = 1;
+  RigidArmorSolver solver(config, geometry, shape, prior);
+
+  // Ground truth moves at 60 px/s.  The fourth center has an 8 px outlier;
+  // both adjacent steps still fall inside the ordinary-track gate, so a
+  // last-two-frames estimator would point sharply backwards on the fifth
+  // frame.  Irregular timestamps also verify that the fit uses elapsed time.
+  constexpr double velocity_x_px_s = 60.0;
+  const std::array<double, 5> times{0.000, 0.020, 0.055, 0.090, 0.125};
+  SolverOutput output;
+  for (std::size_t i = 0; i < times.size(); ++i) {
+    float x = static_cast<float>(velocity_x_px_s * times[i]);
+    if (i == 3) x += 8.0F;
+    const ArmorObservation observation =
+        translated_observation(phase_samples.front(), {x, 0.0F});
+    output = solver.update({observation}, times[i], true);
+  }
+
+  expect(output.image_motion_prediction_used,
+         "five valid centers must enable image-motion prediction");
+  expect(output.future_target.valid,
+         "robust image-motion prediction must produce a future target");
+  const double expected_future_x = output.candidate.center.x +
+      velocity_x_px_s * config.prediction_lead_s;
+  expect(std::abs(output.future_target.center.x - expected_future_x) < 0.75,
+         "Theil-Sen velocity must preserve the constant trend despite one outlier");
+  expect(std::abs(output.future_target.center.y - output.candidate.center.y) < 0.25,
+         "a horizontal robust track must not invent vertical velocity");
+  expect(output.future_target.center.x > output.candidate.center.x + 4.0F,
+         "future target must advance with the robust trend, not the last outlier step");
+}
+
+void test_phase_quad_model_and_render_sources() {
+  Config config;
+  config.shape_phase_bins = 36;
+  config.shape_min_samples_per_bin = 1;
+  config.shape_min_covered_bins = 12;
+  config.shape_smoothing_radius_bins = 2;
+  config.max_prediction_frames = 3;
+  config.prediction_lead_frames = 3;
+  config.prediction_lead_s = 3.0 / 30.0;
+  AffineGeometry geometry;
+  geometry.center = {100, 90};
+  geometry.axis_cos = {42, 0};
+  geometry.axis_sin = {0, 24};
+  const auto samples = synthetic_phase_samples(geometry);
+  const PhaseQuadModel shape = calibrate_phase_quad_model(samples, geometry, config);
+  expect(shape.valid(), "phase quadrilateral model should calibrate");
+  expect(shape.covered_bins() >= 12, "phase quadrilateral model needs sufficient coverage");
+
+  const auto before_wrap = shape.project(1, -1e-4, geometry, {});
+  const auto after_wrap = shape.project(1, kTwoPi - 1e-4, geometry, {});
+  expect(before_wrap.valid && after_wrap.valid, "phase projections must be valid");
+  for (int i = 0; i < 4; ++i)
+    expect(cv::norm(before_wrap.corners[i] - after_wrap.corners[i]) < 0.1,
+           "phase model must interpolate continuously across 2pi");
+  for (int degree = 0; degree < 360; ++degree) {
+    const auto projected = shape.project(1, degree * CV_PI / 180.0, geometry, {});
+    expect(projected.valid && cv::isContourConvex(polygon(projected.corners)),
+           "every learned phase projection must remain a valid convex quadrilateral");
+  }
+
+  MotionPrior prior;
+  prior.valid = true;
+  prior.speed_abs_rad_s = 1.0;
+  prior.phase_direction_sign = 1;
+  RigidArmorSolver solver(config, geometry, shape, prior);
+  const SolverOutput observed = solver.update({samples.front()}, 0.0, true);
+  expect(observed.candidate_available && observed.candidate_slot == 0,
+         "current detector candidate should be exposed separately as slot A1");
+  expect(observed.measurement_used && observed.observed_slot == 0,
+         "first valid detector candidate should initialize slot A1 state");
+  expect(cv::norm(observed.candidate.center - samples.front().center) < 0.1,
+         "red detector candidate must preserve the current light-band observation");
+  expect(observed.prediction_lead_frames == config.prediction_lead_frames &&
+             std::abs(observed.prediction_lead_s - config.prediction_lead_s) < 1e-9,
+         "solver output must report the configured future horizon");
+  int detected_now = 0, model_now = 0;
+  for (const auto& slot : observed.slots) {
+    detected_now += slot.valid && slot.source == BoxSource::kObserved;
+    model_now += slot.valid && slot.source == BoxSource::kPredicted;
+  }
+  expect(detected_now == 1 && model_now == 2,
+         "current slots must contain one exact detection and two current model boxes");
+  expect(observed.future_target.valid &&
+             observed.future_target.source == BoxSource::kPredicted,
+         "the future target must be separate from the current green slots");
+  expect(observed.future_phase_rad > observed.phase_rad,
+         "positive angular speed must advance the future phase");
+  expect(observed.future_phase_rad - observed.phase_rad > 0.05,
+         "configured three-frame horizon must create a measurable phase lead");
+  expect(cv::norm(observed.future_target.center - observed.candidate.center) > 1.0,
+         "future target must move ahead of the current detector box");
+
+  const SolverOutput gated = solver.update({samples[36]}, 1.0 / 30.0, true);
+  expect(gated.candidate_available && !gated.measurement_used,
+         "an out-of-gate light-band quad must remain a visible current candidate");
+  expect(gated.candidate_slot >= 0 && gated.candidate_slot < 3,
+         "a gated candidate should retain its best fixed-ID association for labeling");
+  expect(cv::norm(gated.candidate.center - samples[36].center) < 0.1,
+         "gating must not replace the current detector quadrilateral with a model box");
+  detected_now = 0;
+  for (const auto& slot : gated.slots)
+    detected_now += slot.valid && slot.source == BoxSource::kObserved;
+  expect(detected_now == 1,
+         "a gated current detection must remain the exact visible green recognition box");
+  expect(gated.future_target.valid,
+         "a gated current detection must retain a separate future target");
+
+  const SolverOutput predicted = solver.update({}, 2.0 / 30.0, false);
+  expect(!predicted.candidate_available && predicted.candidate_slot == -1,
+         "a missing detector candidate must remain distinct from model prediction");
+  detected_now = 0; model_now = 0;
+  for (const auto& slot : predicted.slots) {
+    detected_now += slot.valid && slot.source == BoxSource::kObserved;
+    model_now += slot.valid && slot.source == BoxSource::kPredicted;
+  }
+  expect(detected_now == 0 && model_now == 3,
+         "missing detector candidate must expose three current model boxes");
+  expect(predicted.future_target.valid,
+         "short missing intervals should keep a separate future target");
+
+  SolverOutput lost = predicted;
+  for (int i = 0; i < config.max_prediction_frames + 1; ++i)
+    lost = solver.update({}, (i + 3) / 30.0, false);
+  expect(!lost.model_valid, "prediction must expire after max_prediction_frames");
+  for (const auto& slot : lost.slots) expect(!slot.valid, "LOST state must not render armor boxes");
+  expect(!lost.future_target.valid, "LOST state must not render a future target");
+}
+}  // namespace
+
+int main() {
+  try {
+    test_light_band_quad();
+    test_single_light_is_not_full_armor();
+    test_robust_image_velocity_prediction();
+    test_phase_quad_model_and_render_sources();
+    std::cout << "All outpost tests passed.\n";
+    return 0;
+  } catch (const std::exception& error) {
+    std::cerr << "Test failure: " << error.what() << '\n';
+    return 1;
+  }
+}
