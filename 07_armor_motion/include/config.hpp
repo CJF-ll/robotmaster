@@ -1,0 +1,58 @@
+#pragma once
+
+#include <string>
+
+struct Config {
+  std::string solver_mode = "affine";
+  bool camera_enabled = false;
+  int camera_reference_width = 0, camera_reference_height = 0;
+  double fx = 0, fy = 0, cx = 0, cy = 0;
+  double k1 = 0, k2 = 0, p1 = 0, p2 = 0, k3 = 0;
+  double armor_width_m = 0.135, armor_height_m = 0.055, rotation_radius_m = 0.2765;
+  double roi_x_min = 0, roi_y_min = 0, roi_x_max = 1, roi_y_max = 1;
+  int red_min = 72, red_green_diff_min = 12, red_blue_diff_min = 22;
+  double min_light_area = 3, max_light_area = 500;
+  double min_light_length = 8, max_light_length = 42, min_light_ratio = 1.25;
+  double max_light_tilt_deg = 42;
+  double min_pair_distance_ratio = 1.15, max_pair_distance_ratio = 3.4;
+  double max_pair_y_diff_ratio = 0.65, max_pair_length_ratio = 1.65;
+  double max_pair_angle_diff_deg = 24;
+  double quad_end_padding_ratio = 0.08, quad_end_padding_min_px = 1.0;
+  double quad_side_padding_ratio = 0.15, quad_side_padding_min_px = 0.75;
+  double quad_min_area_ratio = 0.45;
+  double quad_min_opposite_edge_ratio = 0.45, quad_max_opposite_edge_ratio = 2.2;
+  int geometry_calibration_stride = 1, ellipse_ransac_iterations = 500;
+  double ellipse_inlier_threshold = 0.16;
+  int min_geometry_samples = 30;
+  int shape_phase_bins = 36, shape_min_samples_per_bin = 3;
+  int shape_min_covered_bins = 12, shape_smoothing_radius_bins = 2;
+  double model_offset_gain = 0.25, model_offset_max_step_px = 8.0;
+  double model_offset_max_magnitude_px = 20.0;
+  double max_observation_distance_px = 55;
+  double phase_gain = 0.62, speed_gain = 0.16, acceleration_gain = 0.025;
+  double speed_prior_gain = 0.18;
+  double speed_measurement_min_ratio = 0.65, speed_measurement_max_ratio = 1.35;
+  double phase_regression_window_s = 0.75, max_phase_innovation_deg = 24.0;
+  double max_abs_speed_deg_s = 540;
+  int max_prediction_frames = 45;
+  int prediction_lead_frames = 3;
+  double prediction_lead_s = 0.0;
+  double prediction_max_acceleration_deg_s2 = 300.0;
+  int prediction_display_max_missed_frames = 15;
+  double prediction_overlap_suppression_px = 3.0;
+  double prediction_overlap_suppression_iou = 0.55;
+  int image_prediction_window_frames = 5;
+  int image_prediction_min_samples = 3;
+  double image_prediction_velocity_gain = 1.0;
+  double image_prediction_max_step_px = 30.0;
+  double image_prediction_jump_min_px = 60.0;
+  double image_prediction_transition_y_tolerance_px = 8.0;
+  double image_prediction_wrap_margin_px = 8.0;
+  double stationary_speed_deg_s = 4, uniform_acceleration_deg_s2 = 28;
+  int mode_hold_frames = 8;
+  double motion_difference_threshold = 0.80;
+  int motion_hold_frames = 4;
+  double period_search_min_s = 1.20, period_search_max_s = 2.80;
+
+  static Config load(const std::string& path);
+};
