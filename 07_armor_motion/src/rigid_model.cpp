@@ -343,6 +343,105 @@ std::array<ProjectedArmor, 3> RigidArmorSolver::project_all(double base_phase) c
   return projected;
 }
 
+ArmorSlotOutput RigidArmorSolver::filter_future_target(
+    const ArmorSlotOutput& raw_target, int target_slot, double timestamp_s,
+    SolverOutput* diagnostics) {
+  diagnostics->future_target_filter_used = false;
+  diagnostics->future_target_filter_reset = false;
+  diagnostics->future_target_filter_innovation_px = 0.0;
+  diagnostics->future_target_filter_velocity_px_s = {};
+
+  if (!raw_target.valid || target_slot < 0 || target_slot >= 3) {
+    future_target_filter_valid_ = false;
+    future_target_filter_slot_ = -1;
+    future_target_filter_velocity_ = {};
+    return raw_target;
+  }
+  if (!config_.future_target_filter_enabled) {
+    future_target_filter_valid_ = false;
+    future_target_filter_slot_ = -1;
+    future_target_filter_velocity_ = {};
+    return raw_target;
+  }
+
+  diagnostics->future_target_filter_used = true;
+  const auto reset_filter = [&]() {
+    future_target_filter_valid_ = true;
+    future_target_filter_slot_ = target_slot;
+    future_target_filter_time_s_ = timestamp_s;
+    future_target_filter_center_ = cv::Point2d(raw_target.center);
+    future_target_filter_velocity_ =
+        detection_velocity_valid_ ? detection_velocity_px_s_ : cv::Point2d{};
+    future_target_filter_velocity_ = limited_step(
+        future_target_filter_velocity_,
+        config_.future_target_filter_max_speed_px_s);
+    for (int corner = 0; corner < 4; ++corner) {
+      future_target_filter_corner_offsets_[corner] =
+          cv::Point2d(raw_target.corners[corner]) -
+          cv::Point2d(raw_target.center);
+    }
+    diagnostics->future_target_filter_reset = true;
+    diagnostics->future_target_filter_velocity_px_s =
+        future_target_filter_velocity_;
+    return raw_target;
+  };
+
+  if (!future_target_filter_valid_ ||
+      future_target_filter_slot_ != target_slot) {
+    return reset_filter();
+  }
+  const double filter_dt = timestamp_s - future_target_filter_time_s_;
+  if (!std::isfinite(filter_dt) || filter_dt <= 1e-6 ||
+      filter_dt > config_.future_target_filter_max_dt_s) {
+    return reset_filter();
+  }
+
+  const cv::Point2d predicted_center =
+      future_target_filter_center_ +
+      future_target_filter_velocity_ * filter_dt;
+  const cv::Point2d innovation =
+      cv::Point2d(raw_target.center) - predicted_center;
+  const double innovation_length = cv::norm(innovation);
+  diagnostics->future_target_filter_innovation_px = innovation_length;
+  if (!std::isfinite(innovation_length) ||
+      innovation_length >
+          config_.future_target_filter_reset_distance_px) {
+    return reset_filter();
+  }
+
+  future_target_filter_center_ =
+      predicted_center +
+      innovation * config_.future_target_filter_position_gain;
+  future_target_filter_velocity_ +=
+      innovation *
+      (config_.future_target_filter_velocity_gain / filter_dt);
+  future_target_filter_velocity_ = limited_step(
+      future_target_filter_velocity_,
+      config_.future_target_filter_max_speed_px_s);
+  for (int corner = 0; corner < 4; ++corner) {
+    const cv::Point2d raw_offset =
+        cv::Point2d(raw_target.corners[corner]) -
+        cv::Point2d(raw_target.center);
+    future_target_filter_corner_offsets_[corner] =
+        future_target_filter_corner_offsets_[corner] *
+            (1.0 - config_.future_target_filter_shape_gain) +
+        raw_offset * config_.future_target_filter_shape_gain;
+  }
+  future_target_filter_time_s_ = timestamp_s;
+
+  ArmorSlotOutput filtered = raw_target;
+  filtered.center = cv::Point2f(future_target_filter_center_);
+  for (int corner = 0; corner < 4; ++corner) {
+    filtered.corners[corner] = cv::Point2f(
+        future_target_filter_center_ +
+        future_target_filter_corner_offsets_[corner]);
+  }
+  if (!valid_projected_quad(filtered.corners)) return reset_filter();
+  diagnostics->future_target_filter_velocity_px_s =
+      future_target_filter_velocity_;
+  return filtered;
+}
+
 MotionMode RigidArmorSolver::classify_mode(double dt) {
   MotionMode candidate;
   const double speed_deg = std::abs(speed_) * 180.0 / CV_PI;
@@ -889,21 +988,24 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
   if (output.image_future_handover && target_slot >= 0 && future_handover_slot_step != 0)
     target_slot = (target_slot + future_handover_slot_step + 3) % 3;
   output.future_slot_index = target_slot;
-  output.future_target.id = target_slot + 1;
+  output.raw_future_target.id = target_slot + 1;
   if (current_model_visible && image_motion_future.has_value() &&
       target_slot >= 0 && target_slot < 3) {
-    output.future_target.valid = true;
-    output.future_target.source = BoxSource::kPredicted;
-    output.future_target.center = image_motion_future->center;
-    output.future_target.corners = image_motion_future->corners;
+    output.raw_future_target.valid = true;
+    output.raw_future_target.source = BoxSource::kPredicted;
+    output.raw_future_target.center = image_motion_future->center;
+    output.raw_future_target.corners = image_motion_future->corners;
     output.image_motion_prediction_used = true;
   } else if (current_model_visible && target_slot >= 0 && target_slot < 3) {
     const auto& target = future_projected[static_cast<std::size_t>(target_slot)];
-    output.future_target.valid = target.valid;
-    output.future_target.source = target.valid ? BoxSource::kPredicted : BoxSource::kNone;
-    output.future_target.center = target.center;
-    output.future_target.corners = target.corners;
+    output.raw_future_target.valid = target.valid;
+    output.raw_future_target.source =
+        target.valid ? BoxSource::kPredicted : BoxSource::kNone;
+    output.raw_future_target.center = target.center;
+    output.raw_future_target.corners = target.corners;
   }
+  output.future_target = filter_future_target(
+      output.raw_future_target, target_slot, timestamp_s, &output);
   output.prediction_valid = output.future_target.valid;
   return output;
 }

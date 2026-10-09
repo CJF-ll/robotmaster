@@ -53,8 +53,25 @@ Config Config::load(const std::string& path) {
   READ(prediction_lead_frames); READ(prediction_lead_s);
   READ(prediction_max_acceleration_deg_s2);
   READ(prediction_display_max_missed_frames);
-  READ(prediction_overlap_suppression_px);
-  READ(prediction_overlap_suppression_iou);
+  int future_target_filter_enabled_int =
+      c.future_target_filter_enabled ? 1 : 0;
+  if (!fs["future_target_filter_enabled"].empty())
+    fs["future_target_filter_enabled"] >> future_target_filter_enabled_int;
+  if (future_target_filter_enabled_int != 0 &&
+      future_target_filter_enabled_int != 1)
+    throw std::runtime_error("future_target_filter_enabled must be 0 or 1");
+  c.future_target_filter_enabled = future_target_filter_enabled_int != 0;
+  READ(future_target_filter_position_gain);
+  READ(future_target_filter_velocity_gain);
+  READ(future_target_filter_shape_gain);
+  READ(future_target_filter_reset_distance_px);
+  READ(future_target_filter_max_dt_s);
+  READ(future_target_filter_max_speed_px_s);
+  READ(prediction_overlap_enter_px);
+  READ(prediction_overlap_exit_px);
+  READ(prediction_overlap_enter_iou);
+  READ(prediction_overlap_exit_iou);
+  READ(prediction_overlap_alpha);
   READ(image_prediction_window_frames); READ(image_prediction_min_samples);
   READ(image_prediction_velocity_gain); READ(image_prediction_history_timeout_s);
   READ(image_prediction_max_step_px);
@@ -131,11 +148,34 @@ Config Config::load(const std::string& path) {
       c.prediction_max_acceleration_deg_s2 < 0 ||
       c.prediction_display_max_missed_frames < 0 ||
       c.prediction_display_max_missed_frames > c.max_prediction_frames ||
-      !finite(c.prediction_overlap_suppression_px) ||
-      c.prediction_overlap_suppression_px < 0 ||
-      !finite(c.prediction_overlap_suppression_iou) ||
-      c.prediction_overlap_suppression_iou < 0 ||
-      c.prediction_overlap_suppression_iou > 1)
+      !finite(c.future_target_filter_position_gain) ||
+      c.future_target_filter_position_gain <= 0 ||
+      c.future_target_filter_position_gain > 1 ||
+      !finite(c.future_target_filter_velocity_gain) ||
+      c.future_target_filter_velocity_gain < 0 ||
+      c.future_target_filter_velocity_gain > 1 ||
+      !finite(c.future_target_filter_shape_gain) ||
+      c.future_target_filter_shape_gain <= 0 ||
+      c.future_target_filter_shape_gain > 1 ||
+      !finite(c.future_target_filter_reset_distance_px) ||
+      c.future_target_filter_reset_distance_px <= 0 ||
+      !finite(c.future_target_filter_max_dt_s) ||
+      c.future_target_filter_max_dt_s <= 0 ||
+      !finite(c.future_target_filter_max_speed_px_s) ||
+      c.future_target_filter_max_speed_px_s <= 0 ||
+      !finite(c.prediction_overlap_enter_px) ||
+      !finite(c.prediction_overlap_exit_px) ||
+      c.prediction_overlap_enter_px < 0 ||
+      c.prediction_overlap_exit_px < c.prediction_overlap_enter_px ||
+      !finite(c.prediction_overlap_enter_iou) ||
+      !finite(c.prediction_overlap_exit_iou) ||
+      c.prediction_overlap_enter_iou < 0 ||
+      c.prediction_overlap_enter_iou > 1 ||
+      c.prediction_overlap_exit_iou < 0 ||
+      c.prediction_overlap_exit_iou > c.prediction_overlap_enter_iou ||
+      !finite(c.prediction_overlap_alpha) ||
+      c.prediction_overlap_alpha <= 0 ||
+      c.prediction_overlap_alpha > 1)
     throw std::runtime_error("invalid future-prediction parameters");
   if (c.image_prediction_window_frames < 3 || c.image_prediction_window_frames > 15 ||
       c.image_prediction_min_samples < 2 ||

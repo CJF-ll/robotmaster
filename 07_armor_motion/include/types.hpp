@@ -71,10 +71,14 @@ struct SolverOutput {
   bool image_handover_spatial_vote = false;
   bool image_handover_progress_vote = false;
   bool image_handover_age_vote = false;
+  bool future_target_filter_used = false;
+  bool future_target_filter_reset = false;
   int image_handover_vote_count = 0;
   int image_track_age_frames = 0;
   double image_track_progress = 0.0;
   double image_normalized_step_px = -1.0;
+  double future_target_filter_innovation_px = 0.0;
+  cv::Point2d future_target_filter_velocity_px_s{};
   int detected_slot_index = -1;
   int measurement_slot_index = -1;
   int candidate_association_slot_index = -1;
@@ -92,5 +96,6 @@ struct SolverOutput {
   ArmorObservation candidate;
   std::array<ArmorSlotOutput, 3> slots{};
   std::array<ArmorSlotOutput, 3> future_model_slots{};
+  ArmorSlotOutput raw_future_target{};
   ArmorSlotOutput future_target{};
 };

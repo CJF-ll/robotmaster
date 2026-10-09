@@ -122,8 +122,17 @@ class RigidArmorSolver {
   cv::Point2d forward_handover_direction_{};
   struct PhaseSample { double time = 0.0; double phase = 0.0; };
   std::deque<PhaseSample> phase_samples_;
+  bool future_target_filter_valid_ = false;
+  int future_target_filter_slot_ = -1;
+  double future_target_filter_time_s_ = 0.0;
+  cv::Point2d future_target_filter_center_{};
+  cv::Point2d future_target_filter_velocity_{};
+  std::array<cv::Point2d, 4> future_target_filter_corner_offsets_{};
 
   std::array<ProjectedArmor, 3> project_all(double base_phase) const;
+  ArmorSlotOutput filter_future_target(const ArmorSlotOutput& raw_target,
+                                       int target_slot, double timestamp_s,
+                                       SolverOutput* diagnostics);
   MotionMode classify_mode(double dt);
   double robust_phase_slope() const;
 };

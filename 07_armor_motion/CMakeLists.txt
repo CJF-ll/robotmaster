@@ -11,6 +11,7 @@ add_library(outpost_core
   src/config.cpp
   src/armor_detector.cpp
   src/rigid_model.cpp
+  src/render_policy.cpp
 )
 target_include_directories(outpost_core PUBLIC include)
 target_link_libraries(outpost_core PUBLIC ${OpenCV_LIBS})

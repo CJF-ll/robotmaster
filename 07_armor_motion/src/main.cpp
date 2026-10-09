@@ -19,6 +19,7 @@
 
 #include "armor_detector.hpp"
 #include "config.hpp"
+#include "render_policy.hpp"
 #include "rigid_model.hpp"
 #include "types.hpp"
 
@@ -483,21 +484,10 @@ std::string source_name(BoxSource source) {
   }
 }
 
-double quad_iou(const std::array<cv::Point2f, 4>& first,
-                const std::array<cv::Point2f, 4>& second) {
-  const std::vector<cv::Point2f> first_polygon(first.begin(), first.end());
-  const std::vector<cv::Point2f> second_polygon(second.begin(), second.end());
-  const double first_area = std::abs(cv::contourArea(first_polygon));
-  const double second_area = std::abs(cv::contourArea(second_polygon));
-  std::vector<cv::Point2f> intersection;
-  const double intersection_area = cv::intersectConvexConvex(
-      first_polygon, second_polygon, intersection, true);
-  const double union_area = first_area + second_area - intersection_area;
-  return union_area > 1e-6 ? intersection_area / union_area : 0.0;
-}
-
 void draw_overlay(cv::Mat& frame, const SolverOutput& state, int frame_number,
-                  const Config& config, bool draw_labels, bool debug_lights) {
+                  const Config& config,
+                  const PredictionRenderDecision& prediction_render,
+                  bool draw_labels, bool debug_lights) {
   for (const auto& slot : state.slots) {
     if (!slot.valid || slot.source == BoxSource::kNone) continue;
     const bool detected_now = slot.source == BoxSource::kObserved;
@@ -516,15 +506,18 @@ void draw_overlay(cv::Mat& frame, const SolverOutput& state, int frame_number,
     }
   }
 
-  const bool future_overlaps_detection = state.future_target.valid &&
-      state.candidate_available &&
-      (cv::norm(state.future_target.center - state.candidate.center) <=
-           config.prediction_overlap_suppression_px ||
-       quad_iou(state.future_target.corners, state.candidate.corners) >=
-           config.prediction_overlap_suppression_iou);
-  if (state.future_target.valid && !future_overlaps_detection) {
+  if (prediction_render.draw) {
     const cv::Scalar future_color(0, 0, 255);
-    draw_dashed_quad(frame, state.future_target.corners, future_color, 2);
+    if (prediction_render.high_overlap) {
+      cv::Mat overlay = frame.clone();
+      draw_dashed_quad(overlay, state.future_target.corners, future_color, 1);
+      cv::circle(overlay, state.future_target.center, 3, future_color, 1,
+                 cv::LINE_AA);
+      cv::addWeighted(overlay, config.prediction_overlap_alpha, frame,
+                      1.0 - config.prediction_overlap_alpha, 0.0, frame);
+    } else {
+      draw_dashed_quad(frame, state.future_target.corners, future_color, 2);
+    }
     if (draw_labels) {
       const std::string label = "A" + std::to_string(state.future_target.id) + " FUT +" +
           std::to_string(state.prediction_lead_frames) + "F";
@@ -553,11 +546,15 @@ void draw_overlay(cv::Mat& frame, const SolverOutput& state, int frame_number,
         << state.prediction_lead_frames << "F / +" << std::fixed << std::setprecision(3)
         << state.prediction_lead_s << "s  predictor="
         << (state.image_motion_prediction_used
-                ? (state.image_prediction_coasting ? "IMAGE-COAST" : "IMAGE")
+                ? (state.image_prediction_coasting
+                       ? "IMAGE-COAST"
+                       : (state.future_target_filter_used ? "IMAGE+STATE" : "IMAGE"))
                 : "PHASE")
         << "  missed=" << state.missed_frames;
   line4 << "green=current detection/model  red=future target"
-        << (state.prediction_valid ? "" : " (hidden)");
+        << (state.prediction_valid
+                ? (prediction_render.high_overlap ? " (dim overlap)" : "")
+                : " (expired)");
   cv::putText(frame, line2.str(), {20, panel_top + 52}, cv::FONT_HERSHEY_SIMPLEX, 0.55,
               cv::Scalar(0, 220, 255), 2, cv::LINE_AA);
   cv::putText(frame, line3.str(), {20, panel_top + 80}, cv::FONT_HERSHEY_SIMPLEX, 0.50,
@@ -671,6 +668,7 @@ int main(int argc, char** argv) {
     ArmorDetector detector(config);
     RigidArmorSolver solver(config, geometry, phase_quad_model, motion_prior);
     OnlineMotionDetector motion_detector(config);
+    PredictionRenderState prediction_render_state;
 
     const auto output_parent = std::filesystem::path(output_path).parent_path();
     if (!output_parent.empty()) std::filesystem::create_directories(output_parent);
@@ -691,6 +689,11 @@ int main(int argc, char** argv) {
            "prediction_lead_s,omega_rad_s,alpha_rad_s2,direction,mode,reprojection_error_px,"
            "missed_frames,future_target_valid,future_slot_index,future_target_id,"
            "future_target_x,future_target_y,"
+           "raw_future_target_valid,raw_future_target_id,raw_future_target_x,"
+           "raw_future_target_y,future_target_filter_used,future_target_filter_reset,"
+           "future_target_filter_innovation_px,future_target_filter_velocity_x,"
+           "future_target_filter_velocity_y,future_render_drawn,"
+           "future_render_high_overlap,future_render_distance_px,future_render_iou,"
            "future_model1_x,future_model1_y,future_model1_area,"
            "future_model2_x,future_model2_y,future_model2_area,future_model3_x,future_model3_y,future_model3_area,"
            "slot1_source,slot1_x,slot1_y,slot2_source,slot2_x,slot2_y,"
@@ -706,7 +709,10 @@ int main(int argc, char** argv) {
       if (!(timestamp_s > 0.0)) timestamp_s = frame_number / fps;
       const SolverOutput state = solver.update(detections.armors, timestamp_s, scene_moving);
       if (state.measurement_used) ++measured_frames;
-      draw_overlay(frame, state, frame_number, config, true, debug_lights);
+      const PredictionRenderDecision prediction_render =
+          evaluate_prediction_render(state, config, &prediction_render_state);
+      draw_overlay(frame, state, frame_number, config, prediction_render, true,
+                   debug_lights);
       if (debug_lights) {
         for (const auto& light : detections.lights) {
           cv::Point2f p[4]; light.rect.points(p);
@@ -744,6 +750,17 @@ int main(int argc, char** argv) {
           << state.future_slot_index << ','
           << state.future_target.id << ',' << state.future_target.center.x << ','
           << state.future_target.center.y << ','
+          << state.raw_future_target.valid << ',' << state.raw_future_target.id << ','
+          << state.raw_future_target.center.x << ','
+          << state.raw_future_target.center.y << ','
+          << state.future_target_filter_used << ','
+          << state.future_target_filter_reset << ','
+          << state.future_target_filter_innovation_px << ','
+          << state.future_target_filter_velocity_px_s.x << ','
+          << state.future_target_filter_velocity_px_s.y << ','
+          << prediction_render.draw << ',' << prediction_render.high_overlap << ','
+          << prediction_render.center_distance_px << ','
+          << prediction_render.quad_iou << ','
           << state.future_model_slots[0].center.x << ','
           << state.future_model_slots[0].center.y << ',' << projected_area(state.future_model_slots[0]) << ','
           << state.future_model_slots[1].center.x << ','
