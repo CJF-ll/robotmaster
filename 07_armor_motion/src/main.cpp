@@ -1,10 +1,12 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -75,6 +77,270 @@ double scalar_median(std::vector<double> values) {
   return *middle;
 }
 
+ArmorObservation median_observation(const std::vector<ArmorObservation>& samples) {
+  ArmorObservation output;
+  if (samples.empty()) return output;
+  std::vector<double> center_x, center_y, widths, heights, scores;
+  std::array<std::vector<double>, 4> corner_x, corner_y;
+  center_x.reserve(samples.size());
+  center_y.reserve(samples.size());
+  for (const auto& sample : samples) {
+    center_x.push_back(sample.center.x);
+    center_y.push_back(sample.center.y);
+    widths.push_back(sample.size.width);
+    heights.push_back(sample.size.height);
+    scores.push_back(sample.score);
+    for (int corner = 0; corner < 4; ++corner) {
+      corner_x[corner].push_back(sample.corners[corner].x);
+      corner_y[corner].push_back(sample.corners[corner].y);
+    }
+  }
+  output.center = {static_cast<float>(scalar_median(center_x)),
+                   static_cast<float>(scalar_median(center_y))};
+  output.size = {static_cast<float>(scalar_median(widths)),
+                 static_cast<float>(scalar_median(heights))};
+  output.score = static_cast<float>(scalar_median(scores));
+  for (int corner = 0; corner < 4; ++corner) {
+    output.corners[corner] = {
+        static_cast<float>(scalar_median(corner_x[corner])),
+        static_cast<float>(scalar_median(corner_y[corner]))};
+  }
+  return output;
+}
+
+struct OfflineHandover {
+  int frame = -1;
+  int source_slot = -1;
+  ArmorObservation exit;
+  ArmorObservation entry;
+};
+
+struct HandoverTrainingSample {
+  int age_frames = 0;
+  double progress = 0.0;
+  bool positive = false;
+};
+
+void fit_handover_age_gate(const std::vector<HandoverTrainingSample>& samples,
+                           int maximum_age,
+                           MotionPrior::HandoverSlotPrior* output) {
+  if (samples.empty()) return;
+  int best_errors = std::numeric_limits<int>::max();
+  int best_false_positives = std::numeric_limits<int>::max();
+  int best_false_negatives = std::numeric_limits<int>::max();
+  int best_age = 0;
+  for (int age = 0; age <= maximum_age; ++age) {
+    int false_positives = 0, false_negatives = 0;
+    for (const auto& sample : samples) {
+      const bool prediction = sample.age_frames >= age;
+      false_positives += prediction && !sample.positive;
+      false_negatives += !prediction && sample.positive;
+    }
+    const int errors = false_positives + false_negatives;
+    if (errors < best_errors ||
+        (errors == best_errors && false_positives < best_false_positives) ||
+        (errors == best_errors && false_positives == best_false_positives &&
+         false_negatives < best_false_negatives) ||
+        (errors == best_errors && false_positives == best_false_positives &&
+         false_negatives == best_false_negatives && age > best_age)) {
+      best_errors = errors;
+      best_false_positives = false_positives;
+      best_false_negatives = false_negatives;
+      best_age = age;
+    }
+  }
+  output->age_threshold_frames = best_age;
+}
+
+void fit_handover_score_gate(
+    const std::vector<HandoverTrainingSample>& samples, const Config& config,
+    MotionPrior::HandoverSlotPrior* output) {
+  if (samples.empty()) return;
+  int best_errors = std::numeric_limits<int>::max();
+  int best_false_positives = std::numeric_limits<int>::max();
+  int best_false_negatives = std::numeric_limits<int>::max();
+  double best_weight = 0.0;
+  double best_threshold = 0.0;
+  const int weight_steps = std::max(
+      0, cvRound(config.image_prediction_handover_age_weight_max_px /
+                 config.image_prediction_handover_age_weight_step_px));
+  for (int weight_index = 0; weight_index <= weight_steps; ++weight_index) {
+    const double weight = weight_index *
+        config.image_prediction_handover_age_weight_step_px;
+    std::vector<double> observed_scores;
+    observed_scores.reserve(samples.size());
+    for (const auto& sample : samples) {
+      observed_scores.push_back(
+          sample.progress - weight * sample.age_frames);
+    }
+    std::sort(observed_scores.begin(), observed_scores.end());
+    observed_scores.erase(
+        std::unique(observed_scores.begin(), observed_scores.end()),
+        observed_scores.end());
+    std::vector<double> thresholds;
+    thresholds.reserve(observed_scores.size() + 1);
+    thresholds.push_back(observed_scores.front() - 1.0);
+    for (std::size_t index = 1; index < observed_scores.size(); ++index) {
+      thresholds.push_back(0.5 * (observed_scores[index - 1] +
+                                  observed_scores[index]));
+    }
+    thresholds.push_back(observed_scores.back() + 1.0);
+    for (double threshold : thresholds) {
+      int false_positives = 0, false_negatives = 0;
+      for (const auto& sample : samples) {
+        const bool prediction =
+            sample.progress - weight * sample.age_frames <= threshold;
+        false_positives += prediction && !sample.positive;
+        false_negatives += !prediction && sample.positive;
+      }
+      const int errors = false_positives + false_negatives;
+      const bool better = errors < best_errors ||
+          (errors == best_errors && false_positives < best_false_positives) ||
+          (errors == best_errors && false_positives == best_false_positives &&
+           false_negatives < best_false_negatives) ||
+          (errors == best_errors && false_positives == best_false_positives &&
+           false_negatives == best_false_negatives && weight < best_weight);
+      if (better) {
+        best_errors = errors;
+        best_false_positives = false_positives;
+        best_false_negatives = false_negatives;
+        best_weight = weight;
+        best_threshold = threshold;
+      }
+    }
+  }
+  output->progress_age_weight_px = best_weight;
+  output->progress_threshold = best_threshold;
+}
+
+void calibrate_handover_prior(
+    const std::vector<std::optional<ArmorObservation>>& observations,
+    const AffineGeometry& geometry, const Config& config, MotionPrior* prior) {
+  if (!config.image_prediction_handover_prior_enabled || observations.empty()) return;
+  std::vector<OfflineHandover> transitions;
+  int previous_frame = -1;
+  for (int frame = 0; frame < static_cast<int>(observations.size()); ++frame) {
+    if (!observations[frame].has_value()) continue;
+    if (previous_frame >= 0) {
+      const int frame_gap = frame - previous_frame;
+      const double step = cv::norm(observations[frame]->center -
+                                   observations[previous_frame]->center) /
+                          std::max(1, frame_gap);
+      if (step >= config.image_prediction_jump_min_px &&
+          step <= config.image_prediction_jump_max_px) {
+        transitions.push_back({frame, -1, *observations[previous_frame],
+                               *observations[frame]});
+      }
+    }
+    previous_frame = frame;
+  }
+  if (transitions.size() < static_cast<std::size_t>(
+          3 * config.image_prediction_handover_min_transitions_per_slot)) return;
+
+  std::vector<double> direction_x, direction_y;
+  std::vector<double> image_direction_x, image_direction_y;
+  for (const auto& transition : transitions) {
+    const cv::Point2d delta =
+        geometry.normalized_coordinates(transition.entry.center) -
+        geometry.normalized_coordinates(transition.exit.center);
+    direction_x.push_back(delta.x);
+    direction_y.push_back(delta.y);
+    const cv::Point2d image_delta =
+        cv::Point2d(transition.entry.center) -
+        cv::Point2d(transition.exit.center);
+    image_direction_x.push_back(image_delta.x);
+    image_direction_y.push_back(image_delta.y);
+  }
+  cv::Point2d forward(scalar_median(direction_x), scalar_median(direction_y));
+  const double forward_length = cv::norm(forward);
+  if (forward_length < 1e-6) return;
+  forward *= 1.0 / forward_length;
+  cv::Point2d image_forward(scalar_median(image_direction_x),
+                            scalar_median(image_direction_y));
+  const double image_forward_length = cv::norm(image_forward);
+  if (image_forward_length < 1e-6) return;
+  image_forward *= 1.0 / image_forward_length;
+
+  std::vector<OfflineHandover> dominant_transitions;
+  dominant_transitions.reserve(transitions.size());
+  int current_slot = 0;
+  for (auto transition : transitions) {
+    const cv::Point2d delta =
+        geometry.normalized_coordinates(transition.entry.center) -
+        geometry.normalized_coordinates(transition.exit.center);
+    if (delta.dot(forward) <= 0.0) continue;
+    transition.source_slot = current_slot;
+    dominant_transitions.push_back(transition);
+    current_slot = (current_slot + 1) % 3;
+  }
+  if (dominant_transitions.size() < static_cast<std::size_t>(
+          3 * config.image_prediction_handover_min_transitions_per_slot)) return;
+
+  prior->handover.forward_direction_normalized = forward;
+  prior->handover.forward_direction_image = image_forward;
+  prior->handover.first_transition_frame = dominant_transitions.front().frame;
+  prior->handover.last_active_frame = prior->detected_motion_end_frame;
+  std::array<std::vector<ArmorObservation>, 3> exits, entries;
+  std::vector<int> transition_frames;
+  std::vector<int> transition_index_by_frame(observations.size(), -1);
+  for (int index = 0; index < static_cast<int>(dominant_transitions.size()); ++index) {
+    const auto& transition = dominant_transitions[index];
+    exits[transition.source_slot].push_back(transition.exit);
+    entries[transition.source_slot].push_back(transition.entry);
+    transition_frames.push_back(transition.frame);
+    transition_index_by_frame[transition.frame] = index;
+  }
+
+  std::vector<int> slots(observations.size(), 0), ages(observations.size(), 0);
+  current_slot = 0;
+  int age = 0;
+  for (int frame = 0; frame < static_cast<int>(observations.size()); ++frame) {
+    if (transition_index_by_frame[frame] >= 0) {
+      current_slot = (current_slot + 1) % 3;
+      age = 0;
+    } else if (frame > 0) {
+      ++age;
+    }
+    slots[frame] = current_slot;
+    ages[frame] = age;
+  }
+
+  std::array<std::vector<HandoverTrainingSample>, 3> training;
+  const int first_frame = std::max(0, prior->detected_motion_start_frame);
+  const int last_frame = std::min(
+      static_cast<int>(observations.size()) - 1, prior->detected_motion_end_frame);
+  for (int frame = first_frame; frame <= last_frame; ++frame) {
+    if (!observations[frame].has_value()) continue;
+    const auto next = std::upper_bound(
+        transition_frames.begin(), transition_frames.end(), frame);
+    const bool positive = next != transition_frames.end() &&
+        *next <= frame + config.prediction_lead_frames;
+    const double progress = cv::Point2d(observations[frame]->center)
+        .dot(image_forward);
+    training[slots[frame]].push_back({ages[frame], progress, positive});
+  }
+
+  bool all_slots_valid = true;
+  for (int slot = 0; slot < 3; ++slot) {
+    auto& slot_prior = prior->handover.slots[slot];
+    slot_prior.transition_samples = static_cast<int>(exits[slot].size());
+    slot_prior.valid = slot_prior.transition_samples >=
+        config.image_prediction_handover_min_transitions_per_slot &&
+        !training[slot].empty();
+    if (!slot_prior.valid) {
+      all_slots_valid = false;
+      continue;
+    }
+    slot_prior.exit_template = median_observation(exits[slot]);
+    slot_prior.entry_template = median_observation(entries[slot]);
+    fit_handover_age_gate(
+        training[slot], config.image_prediction_handover_training_max_age_frames,
+        &slot_prior);
+    fit_handover_score_gate(training[slot], config, &slot_prior);
+  }
+  prior->handover.valid = all_slots_valid;
+}
+
 MotionPrior estimate_motion_prior(const std::string& input_path, const Config& config,
                                   const AffineGeometry& geometry, cv::Size image_size,
                                   double fps) {
@@ -84,16 +350,22 @@ MotionPrior estimate_motion_prior(const std::string& input_path, const Config& c
   ArmorDetector detector(config);
   std::vector<cv::Mat> signatures;
   std::vector<double> raw_phases;
+  std::vector<std::optional<ArmorObservation>> observations;
   cv::Mat raw;
   while (capture.read(raw)) {
     cv::Mat frame = preprocessor.process(raw);
     signatures.push_back(motion_signature(frame, config));
     const DetectionFrame detections = detector.detect(frame);
-    raw_phases.push_back(detections.armors.empty()
-                             ? std::numeric_limits<double>::quiet_NaN()
-                             : geometry.phase_of(detections.armors.front().center));
+    if (detections.armors.empty()) {
+      observations.push_back(std::nullopt);
+      raw_phases.push_back(std::numeric_limits<double>::quiet_NaN());
+    } else {
+      observations.push_back(detections.armors.front());
+      raw_phases.push_back(geometry.phase_of(detections.armors.front().center));
+    }
   }
   MotionPrior prior;
+  prior.calibration_fps = fps;
   if (signatures.size() < 10) return prior;
   std::vector<double> energy(signatures.size(), 0.0);
   for (std::size_t i = 1; i < signatures.size(); ++i)
@@ -148,6 +420,7 @@ MotionPrior estimate_motion_prior(const std::string& input_path, const Config& c
     prior.phase_direction_sign = median_step > 0.0 ? 1 : -1;
     prior.valid = true;
   }
+  calibrate_handover_prior(observations, geometry, config, &prior);
   return prior;
 }
 
@@ -259,16 +532,6 @@ void draw_overlay(cv::Mat& frame, const SolverOutput& state, int frame_number,
                   cv::FONT_HERSHEY_SIMPLEX, 0.43, future_color, 1, cv::LINE_AA);
     }
   }
-  if (state.candidate_available && state.future_target.valid &&
-      cv::norm(state.future_target.center - state.candidate.center) >
-          config.prediction_overlap_suppression_px) {
-    cv::arrowedLine(frame,
-                    cv::Point(cvRound(state.candidate.center.x),
-                              cvRound(state.candidate.center.y)),
-                    cv::Point(cvRound(state.future_target.center.x),
-                              cvRound(state.future_target.center.y)),
-                    cv::Scalar(0, 220, 255), 1, cv::LINE_AA, 0, 0.20);
-  }
 
   const int panel_width = std::min(frame.cols - 20, 540);
   const int panel_top = frame.rows - 125;
@@ -276,8 +539,8 @@ void draw_overlay(cv::Mat& frame, const SolverOutput& state, int frame_number,
                 cv::Scalar(10, 10, 10), cv::FILLED);
   std::string detection_state = "NO DETECTION";
   if (state.candidate_available) {
-    detection_state = "DET A" + std::to_string(state.candidate_slot + 1) +
-        (state.measurement_used ? " / USED" : " / GATED");
+    detection_state = "DET A" + std::to_string(state.detected_slot_index + 1) +
+        (state.candidate_measurement_used ? " / USED" : " / GATED");
   }
   cv::putText(frame, "frame=" + std::to_string(frame_number) + "  " + detection_state,
               {20, panel_top + 24}, cv::FONT_HERSHEY_SIMPLEX, 0.48,
@@ -289,7 +552,9 @@ void draw_overlay(cv::Mat& frame, const SolverOutput& state, int frame_number,
   line3 << "mode=" << mode_name(state.mode) << "  future=+"
         << state.prediction_lead_frames << "F / +" << std::fixed << std::setprecision(3)
         << state.prediction_lead_s << "s  predictor="
-        << (state.image_motion_prediction_used ? "IMAGE" : "PHASE")
+        << (state.image_motion_prediction_used
+                ? (state.image_prediction_coasting ? "IMAGE-COAST" : "IMAGE")
+                : "PHASE")
         << "  missed=" << state.missed_frames;
   line4 << "green=current detection/model  red=future target"
         << (state.prediction_valid ? "" : " (hidden)");
@@ -351,8 +616,7 @@ int main(int argc, char** argv) {
     cv::Size image_size;
     double fps = 0.0;
     const auto samples = collect_geometry_samples(input_path, config, &image_size, &fps);
-    if (config.prediction_lead_s <= 0.0)
-      config.prediction_lead_s = config.prediction_lead_frames / fps;
+    config.resolve_prediction_horizon(fps);
     std::cout << "Config: camera_undistort=" << (config.camera_enabled ? "on" : "off")
               << ", physical=(armor " << config.armor_width_m << 'x'
               << config.armor_height_m << " m, radius " << config.rotation_radius_m
@@ -383,6 +647,20 @@ int main(int argc, char** argv) {
                 << motion_prior.phase_direction_sign << ", active_frames="
                 << motion_prior.detected_motion_start_frame << ".."
                 << motion_prior.detected_motion_end_frame << '\n';
+      if (motion_prior.handover.valid) {
+        std::cout << "Handover prior: first="
+                  << motion_prior.handover.first_transition_frame
+                  << ", direction_normalized=("
+                  << motion_prior.handover.forward_direction_normalized.x << ','
+                  << motion_prior.handover.forward_direction_normalized.y << ")\n";
+        for (int slot = 0; slot < 3; ++slot) {
+          const auto& learned = motion_prior.handover.slots[slot];
+          std::cout << "  A" << slot + 1 << ": events=" << learned.transition_samples
+                    << ", score=progress-" << learned.progress_age_weight_px
+                    << "*age <= " << learned.progress_threshold
+                    << ", age_gate=" << learned.age_threshold_frames << "\n";
+        }
+      }
     } else {
       std::cout << "Motion prior unavailable; falling back to online phase regression.\n";
     }
@@ -402,11 +680,19 @@ int main(int argc, char** argv) {
     csv_path.replace_extension(".csv");
     std::ofstream csv(csv_path);
     if (!csv) throw std::runtime_error("cannot create CSV: " + csv_path.string());
-    csv << "frame,time_s,candidate_available,measurement_used,image_motion_prediction_used,"
-           "candidate_slot,observed_slot,"
+    csv << "frame,time_s,candidate_available,measurement_used,candidate_measurement_used,"
+           "image_motion_prediction_used,"
+           "image_prediction_coasting,image_candidate_used,image_handover_detected,"
+           "image_future_handover,image_handover_spatial_vote,image_handover_progress_vote,"
+           "image_handover_age_vote,image_handover_vote_count,image_track_age_frames,"
+           "image_track_progress,image_normalized_step_px,detected_slot_index,"
+           "measurement_slot_index,candidate_association_slot_index,"
            "candidate_x,candidate_y,raw_ellipse_phase_rad,phase_rad,future_phase_rad,"
            "prediction_lead_s,omega_rad_s,alpha_rad_s2,direction,mode,reprojection_error_px,"
-           "missed_frames,future_target_valid,future_target_id,future_target_x,future_target_y,"
+           "missed_frames,future_target_valid,future_slot_index,future_target_id,"
+           "future_target_x,future_target_y,"
+           "future_model1_x,future_model1_y,future_model1_area,"
+           "future_model2_x,future_model2_y,future_model2_area,future_model3_x,future_model3_y,future_model3_area,"
            "slot1_source,slot1_x,slot1_y,slot2_source,slot2_x,slot2_y,"
            "slot3_source,slot3_x,slot3_y\n";
 
@@ -429,10 +715,25 @@ int main(int argc, char** argv) {
         }
       }
       const double raw_phase = state.candidate_available ? geometry.phase_of(state.candidate.center) : 0.0;
+      const auto projected_area = [](const ArmorSlotOutput& slot) {
+        const std::vector<cv::Point2f> corners(slot.corners.begin(), slot.corners.end());
+        return std::abs(cv::contourArea(corners));
+      };
       csv << frame_number << ',' << std::fixed << std::setprecision(6) << timestamp_s << ','
           << state.candidate_available << ',' << state.measurement_used << ','
-          << state.image_motion_prediction_used << ','
-          << state.candidate_slot << ',' << state.observed_slot << ','
+          << state.candidate_measurement_used << ','
+          << state.image_motion_prediction_used << ',' << state.image_prediction_coasting << ','
+          << state.image_candidate_used << ',' << state.image_handover_detected << ','
+          << state.image_future_handover << ','
+          << state.image_handover_spatial_vote << ','
+          << state.image_handover_progress_vote << ','
+          << state.image_handover_age_vote << ','
+          << state.image_handover_vote_count << ','
+          << state.image_track_age_frames << ','
+          << state.image_track_progress << ','
+          << state.image_normalized_step_px << ','
+          << state.detected_slot_index << ',' << state.measurement_slot_index << ','
+          << state.candidate_association_slot_index << ','
           << (state.candidate_available ? state.candidate.center.x : 0.0F) << ','
           << (state.candidate_available ? state.candidate.center.y : 0.0F) << ',' << raw_phase << ','
           << state.phase_rad << ',' << state.future_phase_rad << ','
@@ -440,8 +741,16 @@ int main(int argc, char** argv) {
           << state.angular_acceleration_rad_s2 << ',' << state.direction << ','
           << mode_name(state.mode) << ',' << state.reprojection_error_px << ','
           << state.missed_frames << ',' << state.future_target.valid << ','
+          << state.future_slot_index << ','
           << state.future_target.id << ',' << state.future_target.center.x << ','
-          << state.future_target.center.y << ',' << source_name(state.slots[0].source) << ','
+          << state.future_target.center.y << ','
+          << state.future_model_slots[0].center.x << ','
+          << state.future_model_slots[0].center.y << ',' << projected_area(state.future_model_slots[0]) << ','
+          << state.future_model_slots[1].center.x << ','
+          << state.future_model_slots[1].center.y << ',' << projected_area(state.future_model_slots[1]) << ','
+          << state.future_model_slots[2].center.x << ','
+          << state.future_model_slots[2].center.y << ',' << projected_area(state.future_model_slots[2]) << ','
+          << source_name(state.slots[0].source) << ','
           << state.slots[0].center.x << ',' << state.slots[0].center.y << ','
           << source_name(state.slots[1].source) << ',' << state.slots[1].center.x << ','
           << state.slots[1].center.y << ',' << source_name(state.slots[2].source) << ','

@@ -48,15 +48,25 @@ struct Config {
   int image_prediction_window_frames = 5;
   int image_prediction_min_samples = 3;
   double image_prediction_velocity_gain = 1.0;
-  double image_prediction_max_step_px = 30.0;
+  double image_prediction_history_timeout_s = 0.15;
+  double image_prediction_max_step_px = 35.0;
   double image_prediction_jump_min_px = 60.0;
+  double image_prediction_jump_max_px = 180.0;
+  double image_prediction_jump_direction_cos_max = -0.5;
   double image_prediction_transition_y_tolerance_px = 8.0;
   double image_prediction_wrap_margin_px = 8.0;
+  bool image_prediction_handover_prior_enabled = true;
+  int image_prediction_handover_vote_threshold = 2;
+  int image_prediction_handover_training_max_age_frames = 30;
+  int image_prediction_handover_min_transitions_per_slot = 3;
+  double image_prediction_handover_age_weight_max_px = 20.0;
+  double image_prediction_handover_age_weight_step_px = 0.25;
   double stationary_speed_deg_s = 4, uniform_acceleration_deg_s2 = 28;
   int mode_hold_frames = 8;
   double motion_difference_threshold = 0.80;
   int motion_hold_frames = 4;
   double period_search_min_s = 1.20, period_search_max_s = 2.80;
 
+  void resolve_prediction_horizon(double fps);
   static Config load(const std::string& path);
 };

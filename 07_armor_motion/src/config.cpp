@@ -1,6 +1,8 @@
 #include "config.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 #include <opencv2/core.hpp>
@@ -54,10 +56,26 @@ Config Config::load(const std::string& path) {
   READ(prediction_overlap_suppression_px);
   READ(prediction_overlap_suppression_iou);
   READ(image_prediction_window_frames); READ(image_prediction_min_samples);
-  READ(image_prediction_velocity_gain); READ(image_prediction_max_step_px);
+  READ(image_prediction_velocity_gain); READ(image_prediction_history_timeout_s);
+  READ(image_prediction_max_step_px);
   READ(image_prediction_jump_min_px);
+  READ(image_prediction_jump_max_px);
+  READ(image_prediction_jump_direction_cos_max);
   READ(image_prediction_transition_y_tolerance_px);
   READ(image_prediction_wrap_margin_px);
+  int image_prediction_handover_prior_enabled_int = 1;
+  if (!fs["image_prediction_handover_prior_enabled"].empty())
+    fs["image_prediction_handover_prior_enabled"] >>
+        image_prediction_handover_prior_enabled_int;
+  if (image_prediction_handover_prior_enabled_int != 0 &&
+      image_prediction_handover_prior_enabled_int != 1)
+    throw std::runtime_error("image_prediction_handover_prior_enabled must be 0 or 1");
+  c.image_prediction_handover_prior_enabled = image_prediction_handover_prior_enabled_int != 0;
+  READ(image_prediction_handover_vote_threshold);
+  READ(image_prediction_handover_training_max_age_frames);
+  READ(image_prediction_handover_min_transitions_per_slot);
+  READ(image_prediction_handover_age_weight_max_px);
+  READ(image_prediction_handover_age_weight_step_px);
   READ(stationary_speed_deg_s); READ(uniform_acceleration_deg_s2); READ(mode_hold_frames);
   READ(motion_difference_threshold); READ(motion_hold_frames);
   READ(period_search_min_s); READ(period_search_max_s);
@@ -107,22 +125,69 @@ Config Config::load(const std::string& path) {
   if (c.model_offset_gain < 0 || c.model_offset_gain > 1 ||
       c.model_offset_max_step_px <= 0 || c.model_offset_max_magnitude_px <= 0)
     throw std::runtime_error("invalid model-offset filter parameters");
-  if (c.prediction_lead_frames < 1 || c.prediction_lead_s < 0 ||
+  if (c.prediction_lead_frames < 1 || !finite(c.prediction_lead_s) ||
+      c.prediction_lead_s < 0 ||
+      !finite(c.prediction_max_acceleration_deg_s2) ||
       c.prediction_max_acceleration_deg_s2 < 0 ||
       c.prediction_display_max_missed_frames < 0 ||
       c.prediction_display_max_missed_frames > c.max_prediction_frames ||
+      !finite(c.prediction_overlap_suppression_px) ||
       c.prediction_overlap_suppression_px < 0 ||
+      !finite(c.prediction_overlap_suppression_iou) ||
       c.prediction_overlap_suppression_iou < 0 ||
       c.prediction_overlap_suppression_iou > 1)
     throw std::runtime_error("invalid future-prediction parameters");
   if (c.image_prediction_window_frames < 3 || c.image_prediction_window_frames > 15 ||
       c.image_prediction_min_samples < 2 ||
       c.image_prediction_min_samples > c.image_prediction_window_frames ||
+      !finite(c.image_prediction_velocity_gain) ||
       c.image_prediction_velocity_gain < 0 || c.image_prediction_velocity_gain > 1 ||
+      !finite(c.image_prediction_history_timeout_s) ||
+      c.image_prediction_history_timeout_s <= 0 ||
+      !finite(c.image_prediction_max_step_px) ||
       c.image_prediction_max_step_px <= 0 ||
+      !finite(c.image_prediction_jump_min_px) ||
       c.image_prediction_jump_min_px <= c.image_prediction_max_step_px ||
+      !finite(c.image_prediction_jump_max_px) ||
+      c.image_prediction_jump_max_px <= c.image_prediction_jump_min_px ||
+      !finite(c.image_prediction_jump_direction_cos_max) ||
+      c.image_prediction_jump_direction_cos_max < -1.0 ||
+      c.image_prediction_jump_direction_cos_max > 0.0 ||
+      !finite(c.image_prediction_transition_y_tolerance_px) ||
       c.image_prediction_transition_y_tolerance_px < 0 ||
-      c.image_prediction_wrap_margin_px < 0)
+      !finite(c.image_prediction_wrap_margin_px) ||
+      c.image_prediction_wrap_margin_px < 0 ||
+      c.image_prediction_handover_vote_threshold < 1 ||
+      c.image_prediction_handover_vote_threshold > 3 ||
+      c.image_prediction_handover_training_max_age_frames < 3 ||
+      c.image_prediction_handover_training_max_age_frames > 300 ||
+      c.image_prediction_handover_min_transitions_per_slot < 1 ||
+      !finite(c.image_prediction_handover_age_weight_max_px) ||
+      c.image_prediction_handover_age_weight_max_px < 0 ||
+      !finite(c.image_prediction_handover_age_weight_step_px) ||
+      c.image_prediction_handover_age_weight_step_px <= 0 ||
+      (c.image_prediction_handover_age_weight_max_px > 0 &&
+       c.image_prediction_handover_age_weight_step_px >
+           c.image_prediction_handover_age_weight_max_px) ||
+      (c.image_prediction_handover_age_weight_max_px > 0 &&
+       (!finite(c.image_prediction_handover_age_weight_max_px /
+                c.image_prediction_handover_age_weight_step_px) ||
+        c.image_prediction_handover_age_weight_max_px /
+                c.image_prediction_handover_age_weight_step_px > 100000.0)))
     throw std::runtime_error("invalid image-motion prediction parameters");
   return c;
+}
+
+void Config::resolve_prediction_horizon(double fps) {
+  if (!std::isfinite(fps) || fps <= 0.0)
+    throw std::runtime_error("prediction horizon requires a positive finite FPS");
+  if (prediction_lead_s > 0.0) {
+    const double requested_frames = prediction_lead_s * fps;
+    if (!std::isfinite(requested_frames) ||
+        requested_frames > std::numeric_limits<int>::max())
+      throw std::runtime_error("prediction horizon is too large");
+    prediction_lead_frames = std::max(
+        1, static_cast<int>(std::lround(requested_frames)));
+  }
+  prediction_lead_s = prediction_lead_frames / fps;
 }

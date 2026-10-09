@@ -96,24 +96,44 @@ angular_speed_snap_tolerance_rad_s: 0.15
 max_prediction_frames: 45
 
 # 绿色框表示本帧检测/模型位置，红色虚线框表示未来目标。默认提前 3 帧
-#（30 fps 时约 0.10 s）。若 prediction_lead_s 大于 0，则优先使用秒数；
-# 否则程序按 lead_frames / 视频 FPS 自动换算。
+#（30 fps 时约 0.10 s）。若 prediction_lead_s 大于 0，程序将秒数按视频
+# FPS 量化到最近的完整帧，并同步回写有效帧数和秒数；否则使用配置的帧数
+# 并按视频 FPS 换算秒数。
 prediction_lead_frames: 3
 prediction_lead_s: 0.0
 prediction_max_acceleration_deg_s2: 300.0
 prediction_display_max_missed_frames: 15
-prediction_overlap_suppression_px: 3.0
-prediction_overlap_suppression_iou: 0.55
+prediction_overlap_suppression_px: 8.0
+prediction_overlap_suppression_iou: 0.20
 
 # 同一块已检测装甲的短期位置由最近 5 个有效中心的 Theil-Sen 鲁棒直线
 # 拟合外推；周期性从左端跳回右端时重开窗口，不把交接当作巨大速度。
+# 状态相位门控与图像连续性门控相互独立：连续步长不超过 35 px；60--180 px
+# 只有在跳变方向与此前速度相反且跨过轨道中心时才视为换板。其余候选不写入
+# 速度历史，只在 timeout 内沿用此前可信速度。以下像素阈值对应 668x688 视频。
 image_prediction_window_frames: 5
 image_prediction_min_samples: 3
 image_prediction_velocity_gain: 1.0
-image_prediction_max_step_px: 30.0
+image_prediction_history_timeout_s: 0.15
+image_prediction_max_step_px: 35.0
 image_prediction_jump_min_px: 60.0
+image_prediction_jump_max_px: 180.0
+image_prediction_jump_direction_cos_max: -0.5
 image_prediction_transition_y_tolerance_px: 8.0
 image_prediction_wrap_margin_px: 8.0
+
+# 程序从整段视频的真实换板事件学习每个固定编号的退出/进入模板、
+# “轨迹进度 - 权重 * 帧龄”分数门限和独立帧龄门限。未来 3 帧是否换板由
+# “空间越界、分数、帧龄”三项证据投票，达到 2 票才切换预测目标；
+# 每个编号至少有 3 次事件才启用该先验。max_age 只限制独立帧龄门限的
+# 离线搜索范围，weight_max 和 weight_step 控制线性分数的权重网格；
+# 它们都不会写死当前视频的具体交接帧或坐标。
+image_prediction_handover_prior_enabled: 1
+image_prediction_handover_vote_threshold: 2
+image_prediction_handover_training_max_age_frames: 30
+image_prediction_handover_min_transitions_per_slot: 3
+image_prediction_handover_age_weight_max_px: 20.0
+image_prediction_handover_age_weight_step_px: 0.25
 
 stationary_speed_deg_s: 4.0
 uniform_acceleration_deg_s2: 28.0

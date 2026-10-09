@@ -18,6 +18,7 @@ struct AffineGeometry {
 
   cv::Point2d point(double phase) const;
   cv::Point2d tangent(double phase) const;
+  cv::Point2d normalized_coordinates(const cv::Point2d& point) const;
   double phase_of(const cv::Point2d& point) const;
 };
 
@@ -28,6 +29,25 @@ struct MotionPrior {
   int repeat_period_frames = 0;
   int detected_motion_start_frame = -1;
   int detected_motion_end_frame = -1;
+  double calibration_fps = 30.0;
+
+  struct HandoverSlotPrior {
+    bool valid = false;
+    int transition_samples = 0;
+    ArmorObservation exit_template{};
+    ArmorObservation entry_template{};
+    double progress_age_weight_px = 0.0;
+    double progress_threshold = 0.0;
+    int age_threshold_frames = 0;
+  };
+  struct HandoverPrior {
+    bool valid = false;
+    cv::Point2d forward_direction_normalized{};
+    cv::Point2d forward_direction_image{};
+    int first_transition_frame = -1;
+    int last_active_frame = -1;
+    std::array<HandoverSlotPrior, 3> slots{};
+  } handover;
 };
 
 AffineGeometry calibrate_affine_geometry(const std::vector<ArmorObservation>& samples,
@@ -91,11 +111,15 @@ class RigidArmorSolver {
   };
   std::deque<DetectionSample> detection_history_;
   int display_candidate_slot_ = -1;
+  int frames_since_handover_ = 0;
   struct JumpTransition {
     ArmorObservation exit;
     ArmorObservation entry;
+    int slot_step = 1;
   };
   std::deque<JumpTransition> jump_transitions_;
+  bool handover_direction_valid_ = false;
+  cv::Point2d forward_handover_direction_{};
   struct PhaseSample { double time = 0.0; double phase = 0.0; };
   std::deque<PhaseSample> phase_samples_;
 
