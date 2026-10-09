@@ -3,26 +3,28 @@
 # affine: 无需相机内参，直接拟合圆周在图像中的投影椭圆。
 solver_mode: "affine"
 
-# 相机参数统一放在这里。下列数值来自另一段 1920x1080 标定视频，当前输入为
-# 668x688，因此保持禁用；只有确认相机、镜头、焦距和裁剪方式完全一致时才能开启。
+# 当前视频尺寸为 668x688，但没有对应相机的标定板数据，因此不伪造内参与畸变。
+# 完成这台相机的标定后填入 K、D，并把 camera_enabled 改为 1。
 camera_enabled: 0
-camera_reference_width: 1920
-camera_reference_height: 1080
-fx: 1372.7394218124905
-fy: 1371.2587694629472
-cx: 965.7577184175561
-cy: 542.5699696839304
-k1: -0.010344678488746387
-k2: -0.2988722201317528
-p1: -0.0006726382957941973
-p2: -0.0017065818612824668
-k3: 0.8834860826499183
+camera_reference_width: 668
+camera_reference_height: 688
+fx: 0.0
+fy: 0.0
+cx: 0.0
+cy: 0.0
+k1: 0.0
+k2: 0.0
+p1: 0.0
+p2: 0.0
+k3: 0.0
 
-# 实体尺寸集中配置，单位为米；二维 affine 模式不依赖绝对尺寸，后续 PnP
-# 后端可直接读取这些字段，不需要改源码。
-armor_width_m: 0.135
-armor_height_m: 0.055
-rotation_radius_m: 0.2765
+# 实体参数统一放在 YAML。当前单目视频无法可靠反推出真实尺寸和俯角，因此用 0
+# 表示尚未实测；affine 模式不会使用这些数值。后续实测后直接替换即可。
+armor_width_m: 0.0
+armor_height_m: 0.0
+rotation_radius_m: 0.0
+# 绕相机 X 轴的右手角度，装甲板向下俯为负，单位为度。
+outpost_pitch_deg: 0.0
 
 # 当前视频的目标区域（归一化坐标）。
 roi_x_min: 0.20
@@ -83,6 +85,14 @@ speed_measurement_max_ratio: 1.35
 phase_regression_window_s: 0.75
 max_phase_innovation_deg: 24.0
 max_abs_speed_deg_s: 150.0
+
+# 可选的匀速吸附。方向沿用估计值的正负，只配置速度绝对值。当前视频运动段
+# 实测中位数约为 1.1106 rad/s；默认关闭，继续使用视频观测估计，不套用 2.51。
+angular_speed_snap_enabled: 0
+angular_speed_snap_rad_s: 1.1106
+angular_speed_snap_tolerance_rad_s: 0.15
+
+# 连续漏检达到以下帧数前继续维持模型；显示阈值不得大于模型失效阈值。
 max_prediction_frames: 45
 
 # 绿色框表示本帧检测/模型位置，红色虚线框表示未来目标。默认提前 3 帧

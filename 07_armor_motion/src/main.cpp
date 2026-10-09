@@ -353,6 +353,15 @@ int main(int argc, char** argv) {
     const auto samples = collect_geometry_samples(input_path, config, &image_size, &fps);
     if (config.prediction_lead_s <= 0.0)
       config.prediction_lead_s = config.prediction_lead_frames / fps;
+    std::cout << "Config: camera_undistort=" << (config.camera_enabled ? "on" : "off")
+              << ", physical=(armor " << config.armor_width_m << 'x'
+              << config.armor_height_m << " m, radius " << config.rotation_radius_m
+              << " m, pitch " << config.outpost_pitch_deg << " deg)"
+              << ", speed_snap=" << (config.angular_speed_snap_enabled ? "on" : "off")
+              << " (" << config.angular_speed_snap_rad_s << " +/- "
+              << config.angular_speed_snap_tolerance_rad_s << " rad/s)"
+              << ", missed_frames=" << config.prediction_display_max_missed_frames
+              << '/' << config.max_prediction_frames << '\n';
     const AffineGeometry geometry = calibrate_affine_geometry(samples, config, image_size);
     const PhaseQuadModel phase_quad_model = calibrate_phase_quad_model(samples, geometry, config);
     if (!phase_quad_model.valid())

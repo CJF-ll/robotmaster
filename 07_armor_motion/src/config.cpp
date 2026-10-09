@@ -1,5 +1,6 @@
 #include "config.hpp"
 
+#include <cmath>
 #include <stdexcept>
 
 #include <opencv2/core.hpp>
@@ -12,11 +13,14 @@ Config Config::load(const std::string& path) {
   READ(solver_mode);
   int camera_enabled_int = 0;
   if (!fs["camera_enabled"].empty()) fs["camera_enabled"] >> camera_enabled_int;
+  if (camera_enabled_int != 0 && camera_enabled_int != 1)
+    throw std::runtime_error("camera_enabled must be 0 or 1");
   c.camera_enabled = camera_enabled_int != 0;
   READ(camera_reference_width); READ(camera_reference_height);
   READ(fx); READ(fy); READ(cx); READ(cy);
   READ(k1); READ(k2); READ(p1); READ(p2); READ(k3);
   READ(armor_width_m); READ(armor_height_m); READ(rotation_radius_m);
+  READ(outpost_pitch_deg);
   READ(roi_x_min); READ(roi_y_min); READ(roi_x_max); READ(roi_y_max);
   READ(red_min); READ(red_green_diff_min); READ(red_blue_diff_min);
   READ(min_light_area); READ(max_light_area); READ(min_light_length);
@@ -35,7 +39,15 @@ Config Config::load(const std::string& path) {
   READ(max_observation_distance_px); READ(phase_gain); READ(speed_gain);
   READ(speed_prior_gain); READ(speed_measurement_min_ratio); READ(speed_measurement_max_ratio);
   READ(acceleration_gain); READ(phase_regression_window_s); READ(max_phase_innovation_deg);
-  READ(max_abs_speed_deg_s); READ(max_prediction_frames);
+  READ(max_abs_speed_deg_s);
+  int angular_speed_snap_enabled_int = 0;
+  if (!fs["angular_speed_snap_enabled"].empty())
+    fs["angular_speed_snap_enabled"] >> angular_speed_snap_enabled_int;
+  if (angular_speed_snap_enabled_int != 0 && angular_speed_snap_enabled_int != 1)
+    throw std::runtime_error("angular_speed_snap_enabled must be 0 or 1");
+  c.angular_speed_snap_enabled = angular_speed_snap_enabled_int != 0;
+  READ(angular_speed_snap_rad_s); READ(angular_speed_snap_tolerance_rad_s);
+  READ(max_prediction_frames);
   READ(prediction_lead_frames); READ(prediction_lead_s);
   READ(prediction_max_acceleration_deg_s2);
   READ(prediction_display_max_missed_frames);
@@ -52,14 +64,36 @@ Config Config::load(const std::string& path) {
 #undef READ
   if (c.solver_mode != "affine" && c.solver_mode != "auto" && c.solver_mode != "pnp")
     throw std::runtime_error("solver_mode must be affine, auto, or pnp");
+  const auto finite = [](double value) { return std::isfinite(value); };
   if (!(0 <= c.roi_x_min && c.roi_x_min < c.roi_x_max && c.roi_x_max <= 1 &&
         0 <= c.roi_y_min && c.roi_y_min < c.roi_y_max && c.roi_y_max <= 1))
     throw std::runtime_error("invalid normalized ROI");
-  if (c.camera_enabled && (c.fx <= 0 || c.fy <= 0 || c.camera_reference_width <= 0 ||
-                           c.camera_reference_height <= 0))
+  if (!finite(c.fx) || !finite(c.fy) || !finite(c.cx) || !finite(c.cy) ||
+      !finite(c.k1) || !finite(c.k2) || !finite(c.p1) || !finite(c.p2) ||
+      !finite(c.k3))
+    throw std::runtime_error("camera parameters must be finite");
+  if (c.camera_enabled &&
+      (c.fx <= 0 || c.fy <= 0 || c.camera_reference_width <= 0 ||
+       c.camera_reference_height <= 0))
     throw std::runtime_error("camera_enabled requires valid intrinsics and reference size");
-  if (c.armor_width_m <= 0 || c.armor_height_m <= 0 || c.rotation_radius_m <= 0)
-    throw std::runtime_error("physical dimensions must be positive");
+  if (!finite(c.armor_width_m) || !finite(c.armor_height_m) ||
+      !finite(c.rotation_radius_m) || !finite(c.outpost_pitch_deg) ||
+      c.armor_width_m < 0 || c.armor_height_m < 0 || c.rotation_radius_m < 0 ||
+      c.outpost_pitch_deg <= -90.0 || c.outpost_pitch_deg >= 90.0)
+    throw std::runtime_error("invalid physical model parameters");
+  if (c.solver_mode == "pnp" &&
+      (c.armor_width_m <= 0 || c.armor_height_m <= 0 || c.rotation_radius_m <= 0))
+    throw std::runtime_error("pnp requires positive physical dimensions");
+  if (!finite(c.max_abs_speed_deg_s) || c.max_abs_speed_deg_s <= 0 ||
+      !finite(c.angular_speed_snap_rad_s) || c.angular_speed_snap_rad_s < 0 ||
+      !finite(c.angular_speed_snap_tolerance_rad_s) ||
+      c.angular_speed_snap_tolerance_rad_s < 0 ||
+      (c.angular_speed_snap_enabled && c.angular_speed_snap_rad_s <= 0) ||
+      (c.angular_speed_snap_enabled &&
+       c.angular_speed_snap_rad_s > c.max_abs_speed_deg_s * CV_PI / 180.0))
+    throw std::runtime_error("invalid angular-speed constraints");
+  if (c.max_prediction_frames < 0)
+    throw std::runtime_error("max_prediction_frames must be non-negative");
   if (c.quad_end_padding_ratio < 0 || c.quad_end_padding_min_px < 0 ||
       c.quad_side_padding_ratio < 0 || c.quad_side_padding_min_px < 0 ||
       c.quad_min_area_ratio <= 0 || c.quad_min_opposite_edge_ratio <= 0 ||

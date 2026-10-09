@@ -99,7 +99,7 @@ p_i(theta) = center + axis_cos * cos(theta + i*120°)
 
 该表达式对应圆周在固定相机画面中的椭圆投影。程序先扫描整段视频，从有效观测拟合投影中心和两条椭圆轴，再根据图像帧间差分定位运动区间，并通过自相关估计三块装甲板的重复周期。角速度和旋转方向均由视频观测计算，不使用写死的运动轨迹。
 
-本次输入视频为 668 × 688，而配置中已有的标定参数来自另一段 1920 × 1080 视频，因此我在本次实验中将 `camera_enabled` 设为 `0`，直接在原始二维画面中完成解算。相机内参、五个畸变参数、装甲板宽高和旋转半径均保存在 YAML 中；其中实体尺寸不参与本次 `affine` 解算。
+本次输入视频为 668 × 688，没有与这台相机、镜头和裁剪方式匹配的标定板数据，因此我将 `camera_enabled` 设为 `0`，并把内参与畸变项保留为 YAML 中的未标定值，不再使用其他仓库的相机参数。装甲板宽高、旋转半径和固定俯角也统一保存在 YAML 中；当前视频无法从单目画面可靠反推出这些实体量，所以未实测值记为 `0`，且不参与本次 `affine` 解算。
 
 ### 4. 相位四边形模型与固定编号
 
@@ -131,7 +131,7 @@ future_center = current_center + robust_velocity * prediction_lead_s
 
 - `solver_mode`：本次实验使用的二维解算模式，值为 `affine`。
 - `camera_enabled`、`camera_reference_width/height`、`fx/fy/cx/cy`、`k1/k2/p1/p2/k3`：图像去畸变和相机标定参数。
-- `armor_width_m`、`armor_height_m`、`rotation_radius_m`：装甲板和旋转机构的实体尺寸记录。
+- `armor_width_m`、`armor_height_m`、`rotation_radius_m`、`outpost_pitch_deg`：装甲板和旋转机构的实体参数记录。
 - `roi_*`：检测区域的归一化边界。
 - `red_*`、`min_light_*`、`max_light_*`：红橙灯带的颜色和几何筛选阈值。
 - `min_pair_*`、`max_pair_*`：双灯带配对阈值。
@@ -139,11 +139,26 @@ future_center = current_center + robust_velocity * prediction_lead_s
 - `geometry_*`、`ellipse_*`：椭圆投影几何的离线标定参数。
 - `shape_*`、`model_offset_*`：相位四边形学习、循环平滑和模型偏移参数。
 - `phase_*`、`speed_*`、`acceleration_*`、`max_observation_distance_px`：关联与运动状态滤波参数。
+- `angular_speed_snap_enabled`、`angular_speed_snap_rad_s`、`angular_speed_snap_tolerance_rad_s`：可选角速度吸附开关、目标绝对值和容差。速度方向仍由观测决定。
+- `max_prediction_frames`、`prediction_display_max_missed_frames`：连续漏检后的模型失效帧数和预测框显示帧数，后者不得大于前者。
 - `prediction_lead_frames`、`prediction_lead_s`：预测提前帧数和秒数。本次配置为 3 帧、自动按帧率换算秒数。
 - `prediction_*`：角加速度限制、漏检显示时限和重叠隐藏阈值。
 - `image_prediction_*`：五帧鲁棒拟合、连续步长和周期性交接参数。
 - `stationary_*`、`uniform_*`、`mode_hold_frames`：运动模式判定参数。
 - `motion_*`、`period_search_*`：运动区间与重复周期估计参数。
+
+### 更换相机或机构参数
+
+我复制现有 YAML 后直接修改相应字段，再把新文件作为第三个位置参数传入程序：
+
+```bash
+cp config/video.yaml config/new_setup.yaml
+./build/outpost_solver 输入.mp4 输出.mp4 config/new_setup.yaml --no-gui
+```
+
+相机标定参数的单位遵循 OpenCV：`fx/fy/cx/cy` 为像素，`k1/k2/p1/p2/k3` 为五参数畸变系数，`camera_reference_width/height` 为产生该标定结果时的图像尺寸。填写同一相机配置后将 `camera_enabled` 改为 `1`。
+
+实体宽高与旋转半径使用米，`outpost_pitch_deg` 使用度并规定向下俯为负。角速度吸附值使用 rad/s，只填写绝对值，程序保留估计方向的正负。本次视频测得的运动段角速度中位数约为 `1.1106 rad/s`，配置中默认关闭吸附，运行时仍使用视频观测结果。
 
 ## 输出结果
 

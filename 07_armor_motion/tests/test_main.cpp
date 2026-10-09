@@ -1,5 +1,6 @@
 #include <array>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -16,6 +17,25 @@ constexpr double kTwoPi = 2.0 * CV_PI;
 void expect(bool condition, const std::string& message) {
   if (!condition) throw std::runtime_error(message);
 }
+
+template <typename Function>
+void expect_throws(Function function, const std::string& message) {
+  try {
+    function();
+  } catch (const std::exception&) {
+    return;
+  }
+  throw std::runtime_error(message);
+}
+
+struct TemporaryConfig {
+  std::filesystem::path path =
+      std::filesystem::temp_directory_path() / "outpost_motion_config_test.yaml";
+  ~TemporaryConfig() {
+    std::error_code error;
+    std::filesystem::remove(path, error);
+  }
+};
 
 LightBar make_light(cv::Point2f center, float length, float width,
                     float angle_from_vertical_deg) {
@@ -115,6 +135,95 @@ ArmorObservation translated_observation(const ArmorObservation& source,
   translated.center += translation;
   for (auto& corner : translated.corners) corner += translation;
   return translated;
+}
+
+void test_config_loading_and_validation() {
+  TemporaryConfig temporary;
+  {
+    cv::FileStorage fs(temporary.path.string(), cv::FileStorage::WRITE);
+    fs << "solver_mode" << "affine";
+    fs << "camera_enabled" << 1;
+    fs << "camera_reference_width" << 668 << "camera_reference_height" << 688;
+    fs << "fx" << 800.0 << "fy" << 810.0 << "cx" << 334.0 << "cy" << 344.0;
+    fs << "k1" << -0.1 << "k2" << 0.02 << "p1" << 0.001 << "p2" << -0.002
+       << "k3" << 0.003;
+    fs << "armor_width_m" << 0.140 << "armor_height_m" << 0.060;
+    fs << "rotation_radius_m" << 0.310 << "outpost_pitch_deg" << -12.0;
+    fs << "max_abs_speed_deg_s" << 150.0;
+    fs << "angular_speed_snap_enabled" << 1;
+    fs << "angular_speed_snap_rad_s" << 2.20;
+    fs << "angular_speed_snap_tolerance_rad_s" << 0.30;
+    fs << "max_prediction_frames" << 21;
+    fs << "prediction_display_max_missed_frames" << 7;
+  }
+  const Config loaded = Config::load(temporary.path.string());
+  expect(loaded.camera_enabled && loaded.camera_reference_width == 668 &&
+             loaded.camera_reference_height == 688,
+         "camera enable and reference size must load from YAML");
+  expect(std::abs(loaded.fx - 800.0) < 1e-9 && std::abs(loaded.k1 + 0.1) < 1e-9,
+         "camera intrinsics and distortion must load from YAML");
+  expect(std::abs(loaded.rotation_radius_m - 0.310) < 1e-9 &&
+             std::abs(loaded.outpost_pitch_deg + 12.0) < 1e-9,
+         "physical radius and pitch must load from YAML");
+  expect(loaded.angular_speed_snap_enabled &&
+             std::abs(loaded.angular_speed_snap_rad_s - 2.20) < 1e-9 &&
+             std::abs(loaded.angular_speed_snap_tolerance_rad_s - 0.30) < 1e-9,
+         "angular-speed snap settings must load from YAML");
+  expect(loaded.max_prediction_frames == 21 &&
+             loaded.prediction_display_max_missed_frames == 7,
+         "missed-frame limits must load from YAML");
+
+  {
+    cv::FileStorage fs(temporary.path.string(), cv::FileStorage::WRITE);
+    fs << "camera_enabled" << 2;
+  }
+  expect_throws([&] { Config::load(temporary.path.string()); },
+                "non-boolean camera_enabled must be rejected");
+
+  {
+    cv::FileStorage fs(temporary.path.string(), cv::FileStorage::WRITE);
+    fs << "max_prediction_frames" << 4;
+    fs << "prediction_display_max_missed_frames" << 5;
+  }
+  expect_throws([&] { Config::load(temporary.path.string()); },
+                "display miss limit above model miss limit must be rejected");
+
+  const Config video_config = Config::load(
+      std::string(OUTPOST_SOURCE_DIR) + "/config/video.yaml");
+  expect(!video_config.camera_enabled && video_config.camera_reference_width == 668 &&
+             video_config.camera_reference_height == 688,
+         "repository video config must use this video's dimensions with calibration disabled");
+  expect(video_config.rotation_radius_m == 0.0 && video_config.outpost_pitch_deg == 0.0,
+         "unknown 3D values must not copy another project's constants");
+  expect(!video_config.angular_speed_snap_enabled &&
+             std::abs(video_config.angular_speed_snap_rad_s - 1.1106) < 1e-6,
+         "video config must keep observed speed available without forcing a snap");
+}
+
+void test_configurable_angular_speed_snap() {
+  Config config;
+  config.shape_phase_bins = 36;
+  config.shape_min_samples_per_bin = 1;
+  config.shape_min_covered_bins = 12;
+  config.shape_smoothing_radius_bins = 2;
+  config.angular_speed_snap_enabled = true;
+  config.angular_speed_snap_rad_s = 1.10;
+  config.angular_speed_snap_tolerance_rad_s = 0.05;
+
+  AffineGeometry geometry;
+  geometry.center = {100, 90};
+  geometry.axis_cos = {42, 0};
+  geometry.axis_sin = {0, 24};
+  const auto samples = synthetic_phase_samples(geometry);
+  const PhaseQuadModel shape = calibrate_phase_quad_model(samples, geometry, config);
+  MotionPrior prior;
+  prior.valid = true;
+  prior.speed_abs_rad_s = 1.08;
+  prior.phase_direction_sign = -1;
+  const SolverOutput output =
+      RigidArmorSolver(config, geometry, shape, prior).update({samples.front()}, 0.0, true);
+  expect(std::abs(output.angular_speed_rad_s + 1.10) < 1e-9,
+         "enabled speed snap must preserve direction and use the configured magnitude");
 }
 
 void test_robust_image_velocity_prediction() {
@@ -277,8 +386,10 @@ void test_phase_quad_model_and_render_sources() {
 
 int main() {
   try {
+    test_config_loading_and_validation();
     test_light_band_quad();
     test_single_light_is_not_full_armor();
+    test_configurable_angular_speed_snap();
     test_robust_image_velocity_prediction();
     test_phase_quad_model_and_render_sources();
     std::cout << "All outpost tests passed.\n";

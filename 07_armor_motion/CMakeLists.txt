@@ -25,5 +25,7 @@ if(BUILD_TESTING)
   add_executable(outpost_tests tests/test_main.cpp)
   target_link_libraries(outpost_tests PRIVATE outpost_core)
   target_compile_options(outpost_tests PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_definitions(outpost_tests PRIVATE
+    OUTPOST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   add_test(NAME outpost_tests COMMAND outpost_tests)
 endif()

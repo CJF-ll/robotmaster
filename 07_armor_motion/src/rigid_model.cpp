@@ -38,6 +38,14 @@ cv::Point2d limited_step(const cv::Point2d& step, double maximum_length) {
   return step * (maximum_length / length);
 }
 
+double snap_angular_speed(double speed, const Config& config) {
+  if (!config.angular_speed_snap_enabled || std::abs(speed) < 1e-9) return speed;
+  if (std::abs(std::abs(speed) - config.angular_speed_snap_rad_s) >
+      config.angular_speed_snap_tolerance_rad_s)
+    return speed;
+  return std::copysign(config.angular_speed_snap_rad_s, speed);
+}
+
 bool valid_projected_quad(const std::array<cv::Point2f, 4>& corners) {
   const std::vector<cv::Point2f> contour(corners.begin(), corners.end());
   return cv::isContourConvex(contour) && std::abs(cv::contourArea(contour)) >= 1.0;
@@ -481,6 +489,8 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
   } else if (initialized_ && scene_moving_ && motion_prior_.valid && std::abs(speed_) < 0.20) {
     speed_ = motion_prior_.phase_direction_sign * motion_prior_.speed_abs_rad_s;
   }
+  if (initialized_ && scene_moving_)
+    speed_ = snap_angular_speed(speed_, config_);
   last_timestamp_s_ = timestamp_s;
 
   // A global image offset may compensate a small static camera/model mismatch,

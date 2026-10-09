@@ -8,7 +8,8 @@ struct Config {
   int camera_reference_width = 0, camera_reference_height = 0;
   double fx = 0, fy = 0, cx = 0, cy = 0;
   double k1 = 0, k2 = 0, p1 = 0, p2 = 0, k3 = 0;
-  double armor_width_m = 0.135, armor_height_m = 0.055, rotation_radius_m = 0.2765;
+  double armor_width_m = 0.0, armor_height_m = 0.0, rotation_radius_m = 0.0;
+  double outpost_pitch_deg = 0.0;
   double roi_x_min = 0, roi_y_min = 0, roi_x_max = 1, roi_y_max = 1;
   int red_min = 72, red_green_diff_min = 12, red_blue_diff_min = 22;
   double min_light_area = 3, max_light_area = 500;
@@ -34,6 +35,9 @@ struct Config {
   double speed_measurement_min_ratio = 0.65, speed_measurement_max_ratio = 1.35;
   double phase_regression_window_s = 0.75, max_phase_innovation_deg = 24.0;
   double max_abs_speed_deg_s = 540;
+  bool angular_speed_snap_enabled = false;
+  double angular_speed_snap_rad_s = 0.0;
+  double angular_speed_snap_tolerance_rad_s = 0.0;
   int max_prediction_frames = 45;
   int prediction_lead_frames = 3;
   double prediction_lead_s = 0.0;
