@@ -21,6 +21,10 @@ add_executable(outpost_solver src/main.cpp)
 target_link_libraries(outpost_solver PRIVATE outpost_core)
 target_compile_options(outpost_solver PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(outpost_calibrate src/calibrate.cpp)
+target_link_libraries(outpost_calibrate PRIVATE outpost_core)
+target_compile_options(outpost_calibrate PRIVATE -Wall -Wextra -Wpedantic)
+
 include(CTest)
 if(BUILD_TESTING)
   add_executable(outpost_tests tests/test_main.cpp)

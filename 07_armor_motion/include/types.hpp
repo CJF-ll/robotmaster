@@ -47,6 +47,13 @@ struct ArmorSlotOutput {
   cv::Point2f center{};
 };
 
+enum class TrackState {
+  kLost,
+  kDetecting,
+  kTracking,
+  kTempLost,
+};
+
 enum class MotionMode {
   kInitializing,
   kStopped,
@@ -79,6 +86,20 @@ struct SolverOutput {
   double image_normalized_step_px = -1.0;
   double future_target_filter_innovation_px = 0.0;
   cv::Point2d future_target_filter_velocity_px_s{};
+  TrackState track_state = TrackState::kLost;
+  bool track_confirmed = false;
+  bool phase_gate_passed = false;
+  bool physical_speed_valid = false;
+  bool timestamp_gap_reset = false;
+  int track_confirm_hits = 0;
+  double time_since_measurement_s = 0.0;
+  double phase_variance_rad2 = 0.0;
+  double speed_variance_rad2_s2 = 0.0;
+  double phase_innovation_rad = 0.0;
+  double phase_innovation_variance = 0.0;
+  double phase_nis = 0.0;
+  double association_cost = 0.0;
+  double track_confidence = 0.0;
   int detected_slot_index = -1;
   int measurement_slot_index = -1;
   int candidate_association_slot_index = -1;

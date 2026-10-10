@@ -23,14 +23,6 @@ struct AffineGeometry {
 };
 
 struct MotionPrior {
-  bool valid = false;
-  double speed_abs_rad_s = 0.0;
-  int phase_direction_sign = 0;
-  int repeat_period_frames = 0;
-  int detected_motion_start_frame = -1;
-  int detected_motion_end_frame = -1;
-  double calibration_fps = 30.0;
-
   struct HandoverSlotPrior {
     bool valid = false;
     int transition_samples = 0;
@@ -42,16 +34,22 @@ struct MotionPrior {
   };
   struct HandoverPrior {
     bool valid = false;
-    cv::Point2d forward_direction_normalized{};
     cv::Point2d forward_direction_image{};
-    int first_transition_frame = -1;
-    int last_active_frame = -1;
     std::array<HandoverSlotPrior, 3> slots{};
   } handover;
 };
 
 AffineGeometry calibrate_affine_geometry(const std::vector<ArmorObservation>& samples,
                                          const Config& config, cv::Size image_size);
+
+struct PhaseLabeledObservation {
+  ArmorObservation observation;
+  double phase_rad = 0.0;
+};
+
+AffineGeometry calibrate_labeled_affine_geometry(
+    const std::vector<PhaseLabeledObservation>& samples,
+    const Config& config, cv::Size image_size);
 
 class PhaseQuadModel {
  public:
@@ -60,6 +58,8 @@ class PhaseQuadModel {
   int covered_bins() const { return covered_bins_; }
   ProjectedArmor project(int id, double phase, const AffineGeometry& geometry,
                          const cv::Point2d& model_offset) const;
+  void write(cv::FileStorage& storage) const;
+  static PhaseQuadModel read(const cv::FileNode& node);
 
  private:
   struct Bin {
@@ -72,11 +72,34 @@ class PhaseQuadModel {
 
   friend PhaseQuadModel calibrate_phase_quad_model(
       const std::vector<ArmorObservation>&, const AffineGeometry&, const Config&);
+  friend PhaseQuadModel calibrate_labeled_phase_quad_model(
+      const std::vector<PhaseLabeledObservation>&, const AffineGeometry&, const Config&);
 };
 
 PhaseQuadModel calibrate_phase_quad_model(const std::vector<ArmorObservation>& samples,
                                           const AffineGeometry& geometry,
                                           const Config& config);
+
+PhaseQuadModel calibrate_labeled_phase_quad_model(
+    const std::vector<PhaseLabeledObservation>& samples,
+    const AffineGeometry& geometry, const Config& config);
+
+struct CalibrationProfile {
+  static constexpr int kCurrentVersion = 2;
+  int version = kCurrentVersion;
+  cv::Size image_size{};
+  bool undistorted = false;
+  cv::Size camera_reference_size{};
+  cv::Matx33d camera_matrix = cv::Matx33d::zeros();
+  cv::Vec<double, 5> distortion{};
+  int sample_count = 0;
+  AffineGeometry geometry;
+  PhaseQuadModel phase_quad_model;
+};
+
+void save_calibration_profile(const std::string& path,
+                              const CalibrationProfile& profile);
+CalibrationProfile load_calibration_profile(const std::string& path);
 
 class RigidArmorSolver {
  public:
@@ -91,8 +114,14 @@ class RigidArmorSolver {
   PhaseQuadModel phase_quad_model_;
   MotionPrior motion_prior_;
   cv::Point2d model_offset_{};
-  bool initialized_ = false;
+  TrackState track_state_ = TrackState::kLost;
+  bool filter_valid_ = false;
+  int track_confirm_hits_ = 0;
+  int committed_slot_ = -1;
   double last_timestamp_s_ = 0.0;
+  double last_measurement_time_s_ = 0.0;
+  cv::Vec2d phase_filter_state_{0.0, 0.0};
+  cv::Matx22d phase_filter_covariance_ = cv::Matx22d::eye();
   double phase_ = 0.0, speed_ = 0.0, acceleration_ = 0.0;
   double previous_speed_ = 0.0;
   int missed_frames_ = 0;
@@ -112,16 +141,27 @@ class RigidArmorSolver {
   std::deque<DetectionSample> detection_history_;
   int display_candidate_slot_ = -1;
   int frames_since_handover_ = 0;
+  struct HandoverEvent {
+    double time_s = 0.0;
+    int slot_step = 0;
+  };
+  std::deque<HandoverEvent> handover_events_;
+  std::deque<double> physical_speed_samples_;
+  bool physical_speed_valid_ = false;
+  double physical_speed_ = 0.0, physical_acceleration_ = 0.0;
+  std::deque<int> rotation_direction_votes_;
+  bool rotation_direction_valid_ = false;
+  int rotation_direction_sign_ = 0;
   struct JumpTransition {
     ArmorObservation exit;
     ArmorObservation entry;
     int slot_step = 1;
   };
   std::deque<JumpTransition> jump_transitions_;
+  std::optional<JumpTransition> future_handover_latched_transition_;
+  double future_handover_latch_until_s_ = 0.0;
   bool handover_direction_valid_ = false;
   cv::Point2d forward_handover_direction_{};
-  struct PhaseSample { double time = 0.0; double phase = 0.0; };
-  std::deque<PhaseSample> phase_samples_;
   bool future_target_filter_valid_ = false;
   int future_target_filter_slot_ = -1;
   double future_target_filter_time_s_ = 0.0;
@@ -133,6 +173,11 @@ class RigidArmorSolver {
   ArmorSlotOutput filter_future_target(const ArmorSlotOutput& raw_target,
                                        int target_slot, double timestamp_s,
                                        SolverOutput* diagnostics);
+  void reset_tracking_state();
+  void initialize_phase_filter(double phase, double timestamp_s);
+  void predict_phase_filter(double dt);
+  void update_phase_filter(double measurement, double measurement_variance,
+                           double innovation);
+  double measurement_variance(const ArmorObservation& observation) const;
   MotionMode classify_mode(double dt);
-  double robust_phase_slope() const;
 };

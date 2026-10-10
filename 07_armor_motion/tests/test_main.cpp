@@ -156,8 +156,6 @@ void test_config_loading_and_validation() {
     fs << "angular_speed_snap_enabled" << 1;
     fs << "angular_speed_snap_rad_s" << 2.20;
     fs << "angular_speed_snap_tolerance_rad_s" << 0.30;
-    fs << "max_prediction_frames" << 21;
-    fs << "prediction_display_max_missed_frames" << 7;
     fs << "future_target_filter_enabled" << 1;
     fs << "future_target_filter_position_gain" << 0.55;
     fs << "future_target_filter_velocity_gain" << 0.18;
@@ -180,9 +178,6 @@ void test_config_loading_and_validation() {
              std::abs(loaded.angular_speed_snap_rad_s - 2.20) < 1e-9 &&
              std::abs(loaded.angular_speed_snap_tolerance_rad_s - 0.30) < 1e-9,
          "angular-speed snap settings must load from YAML");
-  expect(loaded.max_prediction_frames == 21 &&
-             loaded.prediction_display_max_missed_frames == 7,
-         "missed-frame limits must load from YAML");
   expect(loaded.future_target_filter_enabled &&
              std::abs(loaded.future_target_filter_position_gain - 0.55) < 1e-9 &&
              std::abs(loaded.future_target_filter_velocity_gain - 0.18) < 1e-9 &&
@@ -203,35 +198,11 @@ void test_config_loading_and_validation() {
 
   {
     cv::FileStorage fs(temporary.path.string(), cv::FileStorage::WRITE);
-    fs << "max_prediction_frames" << 4;
-    fs << "prediction_display_max_missed_frames" << 5;
-  }
-  expect_throws([&] { Config::load(temporary.path.string()); },
-                "display miss limit above model miss limit must be rejected");
-
-  {
-    cv::FileStorage fs(temporary.path.string(), cv::FileStorage::WRITE);
     fs << "image_prediction_jump_min_px" << 60.0;
     fs << "image_prediction_jump_max_px" << 50.0;
   }
   expect_throws([&] { Config::load(temporary.path.string()); },
                 "image handover maximum must exceed its minimum");
-
-  {
-    cv::FileStorage fs(temporary.path.string(), cv::FileStorage::WRITE);
-    fs << "image_prediction_handover_age_weight_max_px" << 1.0;
-    fs << "image_prediction_handover_age_weight_step_px" << 2.0;
-  }
-  expect_throws([&] { Config::load(temporary.path.string()); },
-                "handover age-weight step above the search range must be rejected");
-
-  {
-    cv::FileStorage fs(temporary.path.string(), cv::FileStorage::WRITE);
-    fs << "image_prediction_handover_age_weight_max_px" << 0.5;
-    fs << "image_prediction_handover_age_weight_step_px" << 0.75;
-  }
-  expect_throws([&] { Config::load(temporary.path.string()); },
-                "fractional handover weight step above its range must be rejected");
 
   {
     cv::FileStorage fs(temporary.path.string(), cv::FileStorage::WRITE);
@@ -299,15 +270,15 @@ void test_config_loading_and_validation() {
   expect(video_config.rotation_radius_m == 0.0 && video_config.outpost_pitch_deg == 0.0,
          "unknown 3D values must not copy another project's constants");
   expect(!video_config.angular_speed_snap_enabled &&
-             std::abs(video_config.angular_speed_snap_rad_s - 1.1106) < 1e-6,
-         "video config must keep observed speed available without forcing a snap");
+             video_config.angular_speed_snap_rad_s == 0.0 &&
+             video_config.angular_speed_snap_tolerance_rad_s == 0.0,
+         "video config must not carry a disabled preset angular speed");
   expect(std::abs(video_config.image_prediction_history_timeout_s - 0.15) < 1e-9 &&
+             std::abs(video_config.image_prediction_handover_hold_s - 0.90) < 1e-9 &&
              std::abs(video_config.image_prediction_max_step_px - 35.0) < 1e-9 &&
              std::abs(video_config.image_prediction_jump_max_px - 180.0) < 1e-9 &&
-             video_config.image_prediction_handover_prior_enabled &&
-             video_config.image_prediction_handover_vote_threshold == 2 &&
-             std::abs(video_config.image_prediction_handover_age_weight_max_px - 20.0) < 1e-9 &&
-             std::abs(video_config.image_prediction_handover_age_weight_step_px - 0.25) < 1e-9,
+             !video_config.image_prediction_handover_prior_enabled &&
+             video_config.image_prediction_handover_vote_threshold == 2,
          "video config must expose the measured image-continuity thresholds");
   expect(video_config.future_target_filter_enabled &&
              std::abs(video_config.future_target_filter_position_gain - 0.55) < 1e-9 &&
@@ -316,9 +287,20 @@ void test_config_loading_and_validation() {
              std::abs(video_config.future_target_filter_reset_distance_px - 60.0) < 1e-9 &&
              std::abs(video_config.future_target_filter_max_speed_px_s - 1050.0) < 1e-9,
          "video config must expose the measured continuous prediction filter");
+  expect(video_config.track_confirm_hits == 3 &&
+             std::abs(video_config.track_prediction_visible_s - 0.90) < 1e-9 &&
+             std::abs(video_config.track_lost_timeout_s - 1.50) < 1e-9 &&
+             std::abs(video_config.tracker_max_dt_s - 0.20) < 1e-9 &&
+             std::abs(video_config.phase_kf_measurement_std_deg - 10.0) < 1e-9 &&
+             std::abs(video_config.phase_nis_gate - 25.0) < 1e-9,
+         "video config must expose lifecycle and covariance-filter parameters");
+  expect(video_config.physical_speed_handover_stride == 3 &&
+             video_config.physical_speed_window == 5 &&
+             video_config.physical_direction_window == 15,
+         "video config must expose causal handover-speed estimation parameters");
 }
 
-void test_configurable_angular_speed_snap() {
+void test_no_speed_prior_injection() {
   Config config;
   config.shape_phase_bins = 36;
   config.shape_min_samples_per_bin = 1;
@@ -336,13 +318,15 @@ void test_configurable_angular_speed_snap() {
   const auto samples = synthetic_phase_samples(geometry);
   const PhaseQuadModel shape = calibrate_phase_quad_model(samples, geometry, config);
   MotionPrior prior;
-  prior.valid = true;
-  prior.speed_abs_rad_s = 1.08;
-  prior.phase_direction_sign = -1;
   const SolverOutput output =
       RigidArmorSolver(config, geometry, shape, prior).update({samples.front()}, 0.0, true);
-  expect(std::abs(output.angular_speed_rad_s + 1.10) < 1e-9,
-         "enabled speed snap must preserve direction and use the configured magnitude");
+  expect(!output.physical_speed_valid &&
+             std::abs(output.angular_speed_rad_s) < 1e-9,
+         "a configured speed snap must not initialize runtime angular speed");
+  expect(std::abs(output.future_phase_rad - output.phase_rad) < 1e-12 &&
+             output.direction == "UNKNOWN" &&
+             std::abs(output.angular_acceleration_rad_s2) < 1e-12,
+         "no causal speed evidence must remain stationary in phase and explicitly unknown");
 }
 
 void test_robust_image_velocity_prediction() {
@@ -352,7 +336,6 @@ void test_robust_image_velocity_prediction() {
   config.shape_min_covered_bins = 12;
   config.shape_smoothing_radius_bins = 2;
   config.max_observation_distance_px = 55.0;
-  config.max_phase_innovation_deg = 180.0;
   config.prediction_lead_frames = 3;
   config.prediction_lead_s = 0.10;
   config.image_prediction_window_frames = 5;
@@ -367,15 +350,15 @@ void test_robust_image_velocity_prediction() {
   AffineGeometry geometry;
   geometry.center = {100, 90};
   geometry.axis_cos = {42, 0};
+  // Keep this test focused on image-velocity history expiry. Timestamp-gap
+  // reset behavior is covered independently by the tracker lifecycle tests.
+  config.tracker_max_dt_s = 1.0;
   geometry.axis_sin = {0, 24};
   const auto phase_samples = synthetic_phase_samples(geometry);
   const PhaseQuadModel shape = calibrate_phase_quad_model(phase_samples, geometry, config);
   expect(shape.valid(), "robust image prediction test needs a valid phase model");
 
   MotionPrior prior;
-  prior.valid = true;
-  prior.speed_abs_rad_s = 1.0;
-  prior.phase_direction_sign = 1;
   RigidArmorSolver solver(config, geometry, shape, prior);
 
   // Ground truth moves at 60 px/s.  The fourth center has an 8 px outlier;
@@ -449,7 +432,6 @@ void test_continuous_future_filter_and_render_hysteresis() {
   config.shape_min_covered_bins = 12;
   config.shape_smoothing_radius_bins = 2;
   config.max_observation_distance_px = 1000.0;
-  config.max_phase_innovation_deg = 180.0;
   config.prediction_lead_frames = 3;
   config.prediction_lead_s = 0.10;
   config.image_prediction_window_frames = 5;
@@ -470,9 +452,6 @@ void test_continuous_future_filter_and_render_hysteresis() {
   const PhaseQuadModel shape =
       calibrate_phase_quad_model(phase_samples, geometry, config);
   MotionPrior prior;
-  prior.valid = true;
-  prior.speed_abs_rad_s = 1.0;
-  prior.phase_direction_sign = 1;
   RigidArmorSolver solver(config, geometry, shape, prior);
 
   std::vector<double> raw_x;
@@ -576,7 +555,7 @@ void test_periodic_handover_identity_and_future_id() {
   config.shape_min_covered_bins = 12;
   config.shape_smoothing_radius_bins = 2;
   config.max_observation_distance_px = 1000.0;
-  config.max_phase_innovation_deg = 180.0;
+  config.phase_nis_gate = 1.0e6;
   config.prediction_lead_frames = 3;
   config.prediction_lead_s = 0.10;
   config.image_prediction_window_frames = 5;
@@ -600,9 +579,6 @@ void test_periodic_handover_identity_and_future_id() {
   const auto phase_samples = synthetic_phase_samples(geometry);
   const PhaseQuadModel shape = calibrate_phase_quad_model(phase_samples, geometry, config);
   MotionPrior prior;
-  prior.valid = true;
-  prior.speed_abs_rad_s = 1.0;
-  prior.phase_direction_sign = -1;
   RigidArmorSolver solver(config, geometry, shape, prior);
   const auto at_x = [&](float x) {
     return translated_observation(
@@ -651,7 +627,6 @@ void test_learned_handover_cold_start() {
   config.shape_min_covered_bins = 12;
   config.shape_smoothing_radius_bins = 2;
   config.max_observation_distance_px = 1000.0;
-  config.max_phase_innovation_deg = 180.0;
   config.prediction_lead_frames = 3;
   config.prediction_lead_s = 0.10;
   config.image_prediction_handover_prior_enabled = true;
@@ -669,15 +644,8 @@ void test_learned_handover_cold_start() {
   };
 
   MotionPrior prior;
-  prior.valid = true;
-  prior.speed_abs_rad_s = 1.0;
-  prior.phase_direction_sign = -1;
-  prior.calibration_fps = 30.0;
   prior.handover.valid = true;
-  prior.handover.forward_direction_normalized = {1.0, 0.0};
   prior.handover.forward_direction_image = {1.0, 0.0};
-  prior.handover.first_transition_frame = 3;
-  prior.handover.last_active_frame = 100;
   for (auto& slot : prior.handover.slots) {
     slot.valid = true;
     slot.transition_samples = 3;
@@ -707,7 +675,6 @@ void test_candidate_measurement_semantics() {
   config.shape_min_covered_bins = 12;
   config.shape_smoothing_radius_bins = 2;
   config.max_observation_distance_px = 55.0;
-  config.max_phase_innovation_deg = 180.0;
   config.resolve_prediction_horizon(30.0);
   AffineGeometry geometry;
   geometry.center = {100, 90};
@@ -716,9 +683,6 @@ void test_candidate_measurement_semantics() {
   const auto samples = synthetic_phase_samples(geometry);
   const PhaseQuadModel shape = calibrate_phase_quad_model(samples, geometry, config);
   MotionPrior prior;
-  prior.valid = true;
-  prior.speed_abs_rad_s = 1.0;
-  prior.phase_direction_sign = 1;
   RigidArmorSolver solver(config, geometry, shape, prior);
   const SolverOutput initial = solver.update({samples.front()}, 0.0, true);
   expect(initial.measurement_used && initial.candidate_measurement_used,
@@ -744,7 +708,6 @@ void test_phase_quad_model_and_render_sources() {
   config.shape_min_samples_per_bin = 1;
   config.shape_min_covered_bins = 12;
   config.shape_smoothing_radius_bins = 2;
-  config.max_prediction_frames = 3;
   config.prediction_lead_frames = 3;
   config.prediction_lead_s = 3.0 / 30.0;
   AffineGeometry geometry;
@@ -769,9 +732,6 @@ void test_phase_quad_model_and_render_sources() {
   }
 
   MotionPrior prior;
-  prior.valid = true;
-  prior.speed_abs_rad_s = 1.0;
-  prior.phase_direction_sign = 1;
   RigidArmorSolver solver(config, geometry, shape, prior);
   const SolverOutput observed = solver.update({samples.front()}, 0.0, true);
   expect(observed.candidate_available && observed.detected_slot_index == 0,
@@ -780,7 +740,7 @@ void test_phase_quad_model_and_render_sources() {
              observed.measurement_slot_index == 0,
          "first valid detector candidate should initialize slot A1 state");
   expect(cv::norm(observed.candidate.center - samples.front().center) < 0.1,
-         "red detector candidate must preserve the current light-band observation");
+         "green detector candidate must preserve the current light-band observation");
   expect(observed.prediction_lead_frames == config.prediction_lead_frames &&
              std::abs(observed.prediction_lead_s - config.prediction_lead_s) < 1e-9,
          "solver output must report the configured future horizon");
@@ -796,12 +756,10 @@ void test_phase_quad_model_and_render_sources() {
          "the future target must be separate from the current green slots");
   expect(observed.raw_future_target.valid,
          "solver must expose the unfiltered future target for diagnostics");
-  expect(observed.future_phase_rad > observed.phase_rad,
-         "positive angular speed must advance the future phase");
-  expect(observed.future_phase_rad - observed.phase_rad > 0.05,
-         "configured three-frame horizon must create a measurable phase lead");
-  expect(cv::norm(observed.future_target.center - observed.candidate.center) > 1.0,
-         "future target must move ahead of the current detector box");
+  expect(std::abs(observed.future_phase_rad - observed.phase_rad) < 1e-9,
+         "the first frame must not invent angular velocity from an offline prior");
+  expect(cv::norm(observed.future_target.center - observed.candidate.center) < 0.1,
+         "cold-start prediction must remain at the observation until motion is measured");
 
   const SolverOutput handover = solver.update({samples[24]}, 1.0 / 30.0, true);
   expect(handover.measurement_used && handover.measurement_slot_index == 1,
@@ -844,14 +802,294 @@ void test_phase_quad_model_and_render_sources() {
          "short missing intervals should keep a separate future target");
 
   SolverOutput lost = predicted;
-  for (int i = 0; i < config.max_prediction_frames + 1; ++i)
+  const int loss_frames =
+      static_cast<int>(std::ceil(config.track_lost_timeout_s * 30.0)) + 1;
+  for (int i = 0; i < loss_frames; ++i)
     lost = solver.update({}, (i + 4) / 30.0, false);
-  expect(!lost.model_valid, "prediction must expire after max_prediction_frames");
+  expect(!lost.model_valid, "prediction must expire after the elapsed-time loss timeout");
   for (const auto& slot : lost.slots) expect(!slot.valid, "LOST state must not render armor boxes");
   expect(!lost.future_target.valid, "LOST state must not render a future target");
   expect(!lost.raw_future_target.valid && !lost.future_target_filter_used,
          "LOST state must clear both raw and filtered future targets");
 }
+void test_tracker_lifecycle_uses_elapsed_time() {
+  Config config;
+  config.shape_phase_bins = 36;
+  config.shape_min_samples_per_bin = 1;
+  config.shape_min_covered_bins = 12;
+  config.shape_smoothing_radius_bins = 2;
+  config.track_confirm_hits = 3;
+  config.track_confirm_max_gap_s = 0.10;
+  config.track_prediction_visible_s = 0.15;
+  config.track_lost_timeout_s = 0.30;
+  config.tracker_max_dt_s = 0.50;
+  config.max_observation_distance_px = 1000.0;
+  config.phase_nis_gate = 1e6;
+  config.prediction_lead_s = 0.10;
+  config.resolve_prediction_horizon(30.0);
+
+  AffineGeometry geometry;
+  geometry.center = {100, 90};
+  geometry.axis_cos = {42, 0};
+  geometry.axis_sin = {0, 24};
+  const auto samples = synthetic_phase_samples(geometry);
+  const PhaseQuadModel shape =
+      calibrate_phase_quad_model(samples, geometry, config);
+  MotionPrior prior;
+  RigidArmorSolver solver(config, geometry, shape, prior);
+
+  const auto first = solver.update({samples[0]}, 0.00, true);
+  expect(first.track_state == TrackState::kDetecting &&
+             first.track_confirm_hits == 1 &&
+             !first.track_confirmed && !first.model_valid,
+         "first hit must start an unconfirmed track");
+  const auto second = solver.update({samples[0]}, 0.04, true);
+  expect(second.track_state == TrackState::kDetecting &&
+             second.track_confirm_hits == 2,
+         "second timely hit must advance confirmation");
+  const auto confirmed = solver.update({samples[0]}, 0.08, true);
+  expect(confirmed.track_state == TrackState::kTracking &&
+             confirmed.track_confirm_hits == 3 &&
+             confirmed.track_confirmed && confirmed.model_valid,
+         "third timely hit must confirm the track");
+
+  const auto short_miss = solver.update({}, 0.12, true);
+  expect(short_miss.track_state == TrackState::kTempLost &&
+             short_miss.track_confirmed && short_miss.model_valid &&
+             short_miss.missed_frames == 1 &&
+             std::abs(short_miss.time_since_measurement_s - 0.04) < 1e-9 &&
+             short_miss.future_target.valid,
+         "short dropout must coast as TEMP_LOST");
+  const auto hidden = solver.update({}, 0.25, true);
+  expect(hidden.track_state == TrackState::kTempLost &&
+             hidden.model_valid && !hidden.future_target.valid &&
+             std::none_of(hidden.slots.begin(), hidden.slots.end(),
+                          [](const auto& slot) { return slot.valid; }),
+         "render visibility must expire before the retained track identity");
+  const auto lost = solver.update({}, 0.40, true);
+  expect(lost.track_state == TrackState::kLost &&
+             !lost.track_confirmed && !lost.model_valid &&
+             lost.track_confirm_hits == 0 && lost.missed_frames == 0 &&
+             lost.time_since_measurement_s == 0.0 &&
+             lost.phase_variance_rad2 == 0.0 &&
+             lost.speed_variance_rad2_s2 == 0.0 &&
+             !lost.timestamp_gap_reset,
+         "loss timeout must atomically clear the track without claiming a dt reset");
+
+  RigidArmorSolver confirmation_solver(config, geometry, shape, prior);
+  confirmation_solver.update({samples[0]}, 1.00, true);
+  const auto late_hit =
+      confirmation_solver.update({samples[0]}, 1.11, true);
+  expect(late_hit.measurement_used &&
+             late_hit.track_state == TrackState::kDetecting &&
+             late_hit.track_confirm_hits == 1 &&
+             !late_hit.timestamp_gap_reset,
+         "a late second hit must restart rather than continue confirmation");
+}
+
+void test_timestamp_discontinuity_resets_filter() {
+  Config config;
+  config.shape_phase_bins = 36;
+  config.shape_min_samples_per_bin = 1;
+  config.shape_min_covered_bins = 12;
+  config.shape_smoothing_radius_bins = 2;
+  config.track_confirm_hits = 2;
+  config.track_confirm_max_gap_s = 0.10;
+  config.tracker_max_dt_s = 0.20;
+  config.max_observation_distance_px = 1000.0;
+  config.phase_nis_gate = 1e6;
+  config.prediction_lead_s = 0.10;
+  config.resolve_prediction_horizon(30.0);
+
+  AffineGeometry geometry;
+  geometry.center = {100, 90};
+  geometry.axis_cos = {42, 0};
+  geometry.axis_sin = {0, 24};
+  const auto samples = synthetic_phase_samples(geometry);
+  const PhaseQuadModel shape =
+      calibrate_phase_quad_model(samples, geometry, config);
+  MotionPrior prior;
+  RigidArmorSolver solver(config, geometry, shape, prior);
+
+  solver.update({samples[0]}, 0.00, true);
+  const auto before = solver.update({samples[1]}, 0.05, true);
+  expect(before.track_confirmed &&
+             before.future_phase_rad > before.phase_rad + 1e-4,
+         "fixture must learn positive KF velocity before reset");
+
+  const auto gap = solver.update({samples[3]}, 0.30, true);
+  expect(gap.timestamp_gap_reset && gap.measurement_used &&
+             gap.phase_gate_passed &&
+             gap.track_state == TrackState::kDetecting &&
+             gap.track_confirm_hits == 1 &&
+             !gap.track_confirmed && !gap.model_valid &&
+             gap.missed_frames == 0 && gap.phase_nis == 0.0 &&
+             gap.time_since_measurement_s == 0.0 &&
+             std::abs(gap.future_phase_rad - gap.phase_rad) < 1e-12,
+         "oversized dt must reset and cold-start from the current measurement");
+  const double initial_phase_variance = std::pow(
+      config.phase_kf_initial_phase_std_deg * CV_PI / 180.0, 2);
+  const double initial_speed_variance = std::pow(
+      config.phase_kf_initial_speed_std_deg_s * CV_PI / 180.0, 2);
+  expect(std::abs(gap.phase_variance_rad2 - initial_phase_variance) < 1e-12 &&
+             std::abs(gap.speed_variance_rad2_s2 -
+                      initial_speed_variance) < 1e-12,
+         "dt reset must restore the configured initial covariance");
+
+  const auto backwards = solver.update({}, 0.29, true);
+  expect(backwards.timestamp_gap_reset &&
+             backwards.track_state == TrackState::kLost &&
+             !backwards.model_valid &&
+             backwards.phase_variance_rad2 == 0.0 &&
+             backwards.speed_variance_rad2_s2 == 0.0,
+         "non-monotonic timestamp must invalidate the filter");
+}
+
+void test_phase_nis_gate_is_preupdate() {
+  Config config;
+  config.shape_phase_bins = 36;
+  config.shape_min_samples_per_bin = 1;
+  config.shape_min_covered_bins = 12;
+  config.shape_smoothing_radius_bins = 2;
+  config.track_confirm_hits = 1;
+  config.max_observation_distance_px = 1000.0;
+  config.phase_kf_initial_phase_std_deg = 2.0;
+  config.phase_kf_initial_speed_std_deg_s = 1.0;
+  config.phase_kf_measurement_std_deg = 1.0;
+  config.phase_kf_accel_noise_std_deg_s2 = 1.0;
+  config.phase_nis_gate = 9.0;
+  config.resolve_prediction_horizon(30.0);
+
+  AffineGeometry geometry;
+  geometry.center = {100, 90};
+  geometry.axis_cos = {42, 0};
+  geometry.axis_sin = {0, 24};
+  const auto samples = synthetic_phase_samples(geometry);
+  const PhaseQuadModel shape =
+      calibrate_phase_quad_model(samples, geometry, config);
+  MotionPrior prior;
+  RigidArmorSolver solver(config, geometry, shape, prior);
+
+  const auto initial = solver.update({samples[0]}, 0.0, true);
+  const auto rejected =
+      solver.update({samples[6]}, 1.0 / 30.0, true);
+  expect(rejected.candidate_available &&
+             !rejected.measurement_used &&
+             !rejected.candidate_measurement_used &&
+             !rejected.phase_gate_passed &&
+             rejected.phase_nis > config.phase_nis_gate &&
+             rejected.phase_innovation_variance > 0.0 &&
+             rejected.association_cost >= rejected.phase_nis &&
+             rejected.track_state == TrackState::kTempLost &&
+             rejected.missed_frames == 1,
+         "large pre-update NIS must reject assimilation but keep the candidate visible");
+  const double recomputed_nis =
+      rejected.phase_innovation_rad * rejected.phase_innovation_rad /
+      rejected.phase_innovation_variance;
+  expect(std::abs(rejected.phase_nis - recomputed_nis) < 1e-9,
+         "reported NIS must use the pre-update innovation covariance");
+  expect(std::abs(rejected.phase_rad - initial.phase_rad) < 1e-12,
+         "a rejected innovation must not pull the KF state");
+
+  const auto recovered =
+      solver.update({samples[1]}, 2.0 / 30.0, true);
+  expect(recovered.measurement_used && recovered.phase_gate_passed &&
+             recovered.phase_nis < config.phase_nis_gate &&
+             recovered.track_state == TrackState::kTracking &&
+             recovered.missed_frames == 0 &&
+             recovered.time_since_measurement_s == 0.0 &&
+             recovered.phase_variance_rad2 < rejected.phase_variance_rad2,
+         "an in-gate measurement must recover tracking and reduce covariance");
+}
+
+void test_geometry_calibration_rejects_duplicate_centers() {
+  Config config;
+  config.min_geometry_samples = 5;
+  config.ellipse_ransac_iterations = 5;
+  ArmorObservation repeated;
+  repeated.center = {100.0F, 90.0F};
+  repeated.size = {20.0F, 10.0F};
+  repeated.corners = {{{90.0F, 85.0F}, {110.0F, 85.0F},
+                       {110.0F, 95.0F}, {90.0F, 95.0F}}};
+  const std::vector<ArmorObservation> samples(10, repeated);
+  expect_throws(
+      [&] { calibrate_affine_geometry(samples, config, {668, 688}); },
+      "RANSAC must reject fewer than five distinct centers without looping");
+}
+
+void test_calibration_profile_roundtrip_and_version_guard() {
+  Config config;
+  config.shape_phase_bins = 36;
+  config.shape_min_samples_per_bin = 1;
+  config.shape_min_covered_bins = 12;
+  config.shape_smoothing_radius_bins = 2;
+
+  AffineGeometry geometry;
+  geometry.center = {100, 90};
+  geometry.axis_cos = {42, 3};
+  geometry.axis_sin = {-2, 24};
+  geometry.calibration_samples = 72;
+  geometry.calibration_rms_px = 1.25;
+  const auto samples = synthetic_phase_samples(geometry);
+  const PhaseQuadModel shape =
+      calibrate_phase_quad_model(samples, geometry, config);
+
+  CalibrationProfile profile;
+  profile.image_size = {668, 688};
+  profile.undistorted = true;
+  profile.camera_reference_size = {668, 688};
+  profile.camera_matrix = {800.0, 0.0, 334.0,
+                           0.0, 810.0, 344.0,
+                           0.0, 0.0, 1.0};
+  profile.distortion = {-0.10, 0.02, 0.001, -0.002, 0.003};
+  profile.sample_count = static_cast<int>(samples.size());
+  profile.geometry = geometry;
+  profile.phase_quad_model = shape;
+  TemporaryConfig temporary;
+  temporary.path = std::filesystem::temp_directory_path() /
+                   "outpost_calibration_profile_test.yaml";
+  save_calibration_profile(temporary.path.string(), profile);
+  const CalibrationProfile loaded =
+      load_calibration_profile(temporary.path.string());
+
+  expect(loaded.version == CalibrationProfile::kCurrentVersion &&
+             loaded.image_size == profile.image_size &&
+             loaded.undistorted == profile.undistorted &&
+             loaded.sample_count == profile.sample_count &&
+             loaded.camera_reference_size == profile.camera_reference_size &&
+             cv::norm(loaded.camera_matrix - profile.camera_matrix) < 1e-12 &&
+             cv::norm(loaded.distortion - profile.distortion) < 1e-12,
+         "calibration profile metadata must survive a YAML round trip");
+  expect(cv::norm(loaded.geometry.center - profile.geometry.center) < 1e-12 &&
+             cv::norm(loaded.geometry.axis_cos - profile.geometry.axis_cos) < 1e-12 &&
+             cv::norm(loaded.geometry.axis_sin - profile.geometry.axis_sin) < 1e-12 &&
+             loaded.phase_quad_model.bin_count() == shape.bin_count() &&
+             loaded.phase_quad_model.covered_bins() == shape.covered_bins(),
+         "calibration geometry and phase-bin coverage must survive serialization");
+  for (double phase : {0.0, 0.7, CV_PI, kTwoPi - 0.1}) {
+    const auto expected = shape.project(2, phase, geometry, {});
+    const auto actual = loaded.phase_quad_model.project(
+        2, phase, loaded.geometry, {});
+    expect(expected.valid == actual.valid &&
+               cv::norm(expected.center - actual.center) < 1e-6,
+           "loaded phase model must reproduce calibrated projections");
+    for (int corner = 0; corner < 4; ++corner)
+      expect(cv::norm(expected.corners[corner] - actual.corners[corner]) < 1e-5,
+             "loaded phase-model corners must match their saved values");
+  }
+
+  CalibrationProfile degenerate = profile;
+  degenerate.geometry.axis_sin = degenerate.geometry.axis_cos;
+  expect_throws(
+      [&] { save_calibration_profile(temporary.path.string(), degenerate); },
+      "degenerate calibration geometry must be rejected before serialization");
+
+  profile.version = CalibrationProfile::kCurrentVersion + 1;
+  save_calibration_profile(temporary.path.string(), profile);
+  expect_throws([&] { load_calibration_profile(temporary.path.string()); },
+                "unsupported calibration profile versions must be rejected");
+}
+
 }  // namespace
 
 int main() {
@@ -859,13 +1097,18 @@ int main() {
     test_config_loading_and_validation();
     test_light_band_quad();
     test_single_light_is_not_full_armor();
-    test_configurable_angular_speed_snap();
+    test_no_speed_prior_injection();
     test_robust_image_velocity_prediction();
     test_continuous_future_filter_and_render_hysteresis();
     test_periodic_handover_identity_and_future_id();
     test_learned_handover_cold_start();
     test_candidate_measurement_semantics();
     test_phase_quad_model_and_render_sources();
+    test_tracker_lifecycle_uses_elapsed_time();
+    test_timestamp_discontinuity_resets_filter();
+    test_phase_nis_gate_is_preupdate();
+    test_geometry_calibration_rejects_duplicate_centers();
+    test_calibration_profile_roundtrip_and_version_guard();
     std::cout << "All outpost tests passed.\n";
     return 0;
   } catch (const std::exception& error) {

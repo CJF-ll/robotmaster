@@ -59,9 +59,10 @@ quad_min_area_ratio: 0.45
 quad_min_opposite_edge_ratio: 0.45
 quad_max_opposite_edge_ratio: 2.20
 
-# 离线视频先从真实检测结果标定静态投影几何。
+# 独立运行 outpost_calibrate，从标定视频的真实检测结果生成静态投影模型；
+# outpost_solver 只加载生成的模型并按时间顺序处理输入帧。
 geometry_calibration_stride: 1
-ellipse_ransac_iterations: 0
+ellipse_ransac_iterations: 500
 ellipse_inlier_threshold: 0.16
 min_geometry_samples: 30
 
@@ -74,26 +75,44 @@ model_offset_gain: 0.25
 model_offset_max_step_px: 8.0
 model_offset_max_magnitude_px: 20.0
 
-# 相位滤波、关联及状态判定。
+# 关联、速度变化平滑及速度物理上限。
 max_observation_distance_px: 55.0
-phase_gain: 0.62
-speed_gain: 0.38
 acceleration_gain: 0.08
-speed_prior_gain: 0.18
-speed_measurement_min_ratio: 0.65
-speed_measurement_max_ratio: 1.35
-phase_regression_window_s: 0.75
-max_phase_innovation_deg: 24.0
 max_abs_speed_deg_s: 150.0
 
-# 可选的匀速吸附。方向沿用估计值的正负，只配置速度绝对值。当前视频运动段
-# 实测中位数约为 1.1106 rad/s；默认关闭，继续使用视频观测估计，不套用 2.51。
-angular_speed_snap_enabled: 0
-angular_speed_snap_rad_s: 1.1106
-angular_speed_snap_tolerance_rad_s: 0.15
+# 跟踪生命周期与二维相位 Kalman 滤波。运行时只使用当前及历史观测；角速度
+# 由滤波器在线估计，不从完整输入视频注入周期或速度。时间阈值统一使用秒，
+# 因而不依赖 30/60 fps。phase_nis_gate 是一维相位创新的更新前门限。
+track_confirm_hits: 3
+track_confirm_max_gap_s: 0.12
+track_prediction_visible_s: 0.90
+track_lost_timeout_s: 1.50
+tracker_max_dt_s: 0.20
+phase_kf_measurement_std_deg: 10.0
+phase_kf_initial_phase_std_deg: 12.0
+phase_kf_initial_speed_std_deg_s: 90.0
+phase_kf_accel_noise_std_deg_s2: 300.0
+phase_nis_gate: 25.0
+association_pixel_sigma_px: 8.0
+association_score_weight: 0.25
+association_slot_switch_penalty: 0.20
+covariance_floor: 1.0e-9
 
-# 连续漏检达到以下帧数前继续维持模型；显示阈值不得大于模型失效阈值。
-max_prediction_frames: 45
+# 角速度大小由门控接受后的“显示目标切换循环”在线估计：连续 stride 次
+# 选择切换后，同一图像分支重复，对应三块等间距装甲的 120 度旋转；方向
+# 使用门控接受后的槽位编号变化做滑窗多数投票，不由首次跳变方向决定。
+# 参数只描述样本窗口和时间门限，不包含预设角速度、绝对帧号或轨迹。
+physical_speed_handover_stride: 3
+physical_speed_window: 5
+physical_direction_window: 15
+physical_speed_min_interval_s: 0.30
+physical_speed_max_interval_s: 3.00
+physical_speed_acceleration_gain: 0.20
+
+# 可选的匀速吸附。当前关闭且目标值为零，不参与运行时速度估计。
+angular_speed_snap_enabled: 0
+angular_speed_snap_rad_s: 0.0
+angular_speed_snap_tolerance_rad_s: 0.0
 
 # 绿色框表示本帧检测/模型位置，红色虚线框表示未来目标。默认提前 3 帧
 #（30 fps 时约 0.10 s）。若 prediction_lead_s 大于 0，程序将秒数按视频
@@ -102,7 +121,6 @@ max_prediction_frames: 45
 prediction_lead_frames: 3
 prediction_lead_s: 0.0
 prediction_max_acceleration_deg_s2: 300.0
-prediction_display_max_missed_frames: 15
 
 # 红色未来框使用持续的 alpha-beta 预测/校正状态。参数由本视频逐帧回放统计
 # 得到；同一编号内平滑中心和形状，编号切换时直接重置到下一块真实装甲板，
@@ -132,6 +150,9 @@ image_prediction_window_frames: 5
 image_prediction_min_samples: 3
 image_prediction_velocity_gain: 1.0
 image_prediction_history_timeout_s: 0.15
+# 未来换板一旦由因果证据触发，就保持到真实换板或此超时，避免短暂触发后
+# 红框退回当前装甲再跳走。该时间仅是状态保持上限，不指定换板发生时刻。
+image_prediction_handover_hold_s: 0.90
 image_prediction_max_step_px: 35.0
 image_prediction_jump_min_px: 60.0
 image_prediction_jump_max_px: 180.0
@@ -139,25 +160,16 @@ image_prediction_jump_direction_cos_max: -0.5
 image_prediction_transition_y_tolerance_px: 8.0
 image_prediction_wrap_margin_px: 8.0
 
-# 程序从整段视频的真实换板事件学习每个固定编号的退出/进入模板、
-# “轨迹进度 - 权重 * 帧龄”分数门限和独立帧龄门限。未来 3 帧是否换板由
-# “空间越界、分数、帧龄”三项证据投票，达到 2 票才切换预测目标；
-# 每个编号至少有 3 次事件才启用该先验。max_age 只限制独立帧龄门限的
-# 离线搜索范围，weight_max 和 weight_step 控制线性分数的权重网格；
-# 它们都不会写死当前视频的具体交接帧或坐标。
-image_prediction_handover_prior_enabled: 1
+# 可选的已标定换板先验。当前关闭；运行时只使用已经发生并通过门控的换板
+# 逐步学习退出/进入模板，不读取未来帧。启用先验时，投票阈值控制需要
+# 同时满足的交接证据数量，仍不包含具体交接帧、绝对坐标或预设角速度。
+image_prediction_handover_prior_enabled: 0
 image_prediction_handover_vote_threshold: 2
-image_prediction_handover_training_max_age_frames: 30
-image_prediction_handover_min_transitions_per_slot: 3
-image_prediction_handover_age_weight_max_px: 20.0
-image_prediction_handover_age_weight_step_px: 0.25
 
 stationary_speed_deg_s: 4.0
 uniform_acceleration_deg_s2: 28.0
 mode_hold_frames: 8
 
-# 运动先验由视频自相关自动估计；这里只限定合理的搜索区间，不指定角速度。
+# 相邻帧 ROI 差分用于判断机构当前是否运动。
 motion_difference_threshold: 0.80
 motion_hold_frames: 4
-period_search_min_s: 1.20
-period_search_max_s: 2.80

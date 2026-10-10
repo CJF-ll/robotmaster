@@ -80,6 +80,47 @@ bool plausible(const cv::RotatedRect& ellipse, cv::Size image_size) {
          ellipse.center.y < 1.25 * image_size.height;
 }
 
+double required_finite_double(const cv::FileNode& parent,
+                              const std::string& name) {
+  const cv::FileNode node = parent[name];
+  if (node.empty())
+    throw std::runtime_error("calibration profile is missing " + name);
+  double value = 0.0;
+  node >> value;
+  if (!std::isfinite(value))
+    throw std::runtime_error("calibration profile has non-finite " + name);
+  return value;
+}
+
+int required_int(const cv::FileNode& parent, const std::string& name) {
+  const cv::FileNode node = parent[name];
+  if (node.empty())
+    throw std::runtime_error("calibration profile is missing " + name);
+  int value = 0;
+  node >> value;
+  return value;
+}
+
+bool valid_geometry(const AffineGeometry& geometry) {
+  const auto finite_point = [](const cv::Point2d& point) {
+    return std::isfinite(point.x) && std::isfinite(point.y);
+  };
+  const double determinant = geometry.axis_cos.x * geometry.axis_sin.y -
+                             geometry.axis_cos.y * geometry.axis_sin.x;
+  return finite_point(geometry.center) && finite_point(geometry.axis_cos) &&
+         finite_point(geometry.axis_sin) &&
+         cv::norm(geometry.axis_cos) > 1e-6 &&
+         cv::norm(geometry.axis_sin) > 1e-6 &&
+         std::abs(determinant) > 1e-6 &&
+         std::isfinite(geometry.armor_width_scale) &&
+         geometry.armor_width_scale > 0.0 &&
+         std::isfinite(geometry.armor_height_px) &&
+         geometry.armor_height_px > 0.0 &&
+         geometry.calibration_samples >= 5 &&
+         std::isfinite(geometry.calibration_rms_px) &&
+         geometry.calibration_rms_px >= 0.0;
+}
+
 }  // namespace
 
 cv::Point2d AffineGeometry::point(double phase) const {
@@ -112,19 +153,31 @@ AffineGeometry calibrate_affine_geometry(const std::vector<ArmorObservation>& sa
   std::vector<cv::Point2f> points;
   points.reserve(samples.size());
   for (const auto& sample : samples) points.push_back(sample.center);
+  std::vector<cv::Point2f> unique_points;
+  unique_points.reserve(points.size());
+  for (const auto& point : points) {
+    const bool duplicate = std::any_of(
+        unique_points.begin(), unique_points.end(),
+        [&](const cv::Point2f& existing) {
+          return cv::norm(point - existing) < 0.5;
+        });
+    if (!duplicate) unique_points.push_back(point);
+  }
+  if (unique_points.size() < 5)
+    throw std::runtime_error(
+        "projection calibration needs at least five distinct armor centers");
 
   std::mt19937 random(0x524D2026U);
-  std::uniform_int_distribution<std::size_t> choose(0, points.size() - 1);
+  std::vector<std::size_t> sample_indices(unique_points.size());
+  for (std::size_t i = 0; i < sample_indices.size(); ++i) sample_indices[i] = i;
   std::vector<int> best_inliers;
   double best_error = std::numeric_limits<double>::infinity();
   for (int iteration = 0; iteration < config.ellipse_ransac_iterations; ++iteration) {
+    std::shuffle(sample_indices.begin(), sample_indices.end(), random);
     std::vector<cv::Point2f> subset;
-    while (subset.size() < 5) {
-      const cv::Point2f candidate = points[choose(random)];
-      bool duplicate = false;
-      for (const auto& existing : subset) if (cv::norm(candidate - existing) < 0.5) duplicate = true;
-      if (!duplicate) subset.push_back(candidate);
-    }
+    subset.reserve(5);
+    for (std::size_t i = 0; i < 5; ++i)
+      subset.push_back(unique_points[sample_indices[i]]);
     cv::RotatedRect ellipse;
     try { ellipse = cv::fitEllipse(subset); } catch (const cv::Exception&) { continue; }
     if (!plausible(ellipse, image_size)) continue;
@@ -167,6 +220,91 @@ AffineGeometry calibrate_affine_geometry(const std::vector<ArmorObservation>& sa
   geometry.armor_height_px = std::clamp(median(heights), 6.0, 80.0);
   geometry.calibration_samples = static_cast<int>(best_inliers.size());
   geometry.calibration_rms_px = std::sqrt(squared_error / std::max<std::size_t>(1, best_inliers.size()));
+  return geometry;
+}
+
+AffineGeometry calibrate_labeled_affine_geometry(
+    const std::vector<PhaseLabeledObservation>& samples,
+    const Config& config, cv::Size image_size) {
+  if (samples.size() < static_cast<std::size_t>(config.min_geometry_samples))
+    throw std::runtime_error("not enough phase-labeled observations to calibrate geometry");
+
+  const auto fit = [&](const std::vector<int>& indices) {
+    cv::Mat design(static_cast<int>(indices.size()), 3, CV_64F);
+    cv::Mat x(static_cast<int>(indices.size()), 1, CV_64F);
+    cv::Mat y(static_cast<int>(indices.size()), 1, CV_64F);
+    for (int row = 0; row < static_cast<int>(indices.size()); ++row) {
+      const auto& sample = samples[static_cast<std::size_t>(indices[row])];
+      design.at<double>(row, 0) = 1.0;
+      design.at<double>(row, 1) = std::cos(sample.phase_rad);
+      design.at<double>(row, 2) = std::sin(sample.phase_rad);
+      x.at<double>(row, 0) = sample.observation.center.x;
+      y.at<double>(row, 0) = sample.observation.center.y;
+    }
+    cv::Mat coefficients_x, coefficients_y;
+    if (!cv::solve(design, x, coefficients_x, cv::DECOMP_SVD) ||
+        !cv::solve(design, y, coefficients_y, cv::DECOMP_SVD))
+      throw std::runtime_error("phase-labeled affine calibration failed");
+    AffineGeometry geometry;
+    geometry.center = {coefficients_x.at<double>(0), coefficients_y.at<double>(0)};
+    geometry.axis_cos = {coefficients_x.at<double>(1), coefficients_y.at<double>(1)};
+    geometry.axis_sin = {coefficients_x.at<double>(2), coefficients_y.at<double>(2)};
+    return geometry;
+  };
+
+  std::vector<int> indices(samples.size());
+  for (std::size_t index = 0; index < samples.size(); ++index)
+    indices[index] = static_cast<int>(index);
+  AffineGeometry geometry = fit(indices);
+  const double initial_scale = 0.5 *
+      (cv::norm(geometry.axis_cos) + cv::norm(geometry.axis_sin));
+  const double inlier_threshold = std::max(
+      2.0, config.ellipse_inlier_threshold * std::max(1.0, initial_scale));
+  std::vector<int> inliers;
+  for (std::size_t index = 0; index < samples.size(); ++index) {
+    const auto& sample = samples[index];
+    if (cv::norm(cv::Point2d(sample.observation.center) -
+                 geometry.point(sample.phase_rad)) <= inlier_threshold)
+      inliers.push_back(static_cast<int>(index));
+  }
+  if (inliers.size() >= static_cast<std::size_t>(config.min_geometry_samples))
+    geometry = fit(inliers);
+  else
+    inliers = indices;
+
+  const double determinant = geometry.axis_cos.x * geometry.axis_sin.y -
+                             geometry.axis_cos.y * geometry.axis_sin.x;
+  if (!std::isfinite(determinant) || std::abs(determinant) < 1e-6 ||
+      cv::norm(geometry.axis_cos) < 5.0 || cv::norm(geometry.axis_sin) < 5.0 ||
+      geometry.center.x < -0.25 * image_size.width ||
+      geometry.center.x > 1.25 * image_size.width ||
+      geometry.center.y < -0.25 * image_size.height ||
+      geometry.center.y > 1.25 * image_size.height)
+    throw std::runtime_error(
+        "phase-labeled affine geometry is degenerate: determinant=" +
+        std::to_string(determinant) + ", center=(" +
+        std::to_string(geometry.center.x) + "," +
+        std::to_string(geometry.center.y) + "), axes=(" +
+        std::to_string(cv::norm(geometry.axis_cos)) + "," +
+        std::to_string(cv::norm(geometry.axis_sin)) + ")");
+
+  std::vector<double> width_scales, heights;
+  double squared_error = 0.0;
+  for (int index : inliers) {
+    const auto& sample = samples[static_cast<std::size_t>(index)];
+    const double tangent_length = cv::norm(geometry.tangent(sample.phase_rad));
+    if (tangent_length > 1.0)
+      width_scales.push_back(sample.observation.size.width / (2.0 * tangent_length));
+    heights.push_back(sample.observation.size.height);
+    const double error = cv::norm(cv::Point2d(sample.observation.center) -
+                                  geometry.point(sample.phase_rad));
+    squared_error += error * error;
+  }
+  geometry.armor_width_scale = std::clamp(median(width_scales), 0.10, 0.80);
+  geometry.armor_height_px = std::clamp(median(heights), 6.0, 80.0);
+  geometry.calibration_samples = static_cast<int>(inliers.size());
+  geometry.calibration_rms_px = std::sqrt(
+      squared_error / std::max<std::size_t>(1, inliers.size()));
   return geometry;
 }
 
@@ -278,6 +416,103 @@ PhaseQuadModel calibrate_phase_quad_model(const std::vector<ArmorObservation>& s
   return model;
 }
 
+PhaseQuadModel calibrate_labeled_phase_quad_model(
+    const std::vector<PhaseLabeledObservation>& samples,
+    const AffineGeometry& geometry, const Config& config) {
+  PhaseQuadModel model;
+  const int bin_count = std::max(1, config.shape_phase_bins);
+  model.bins_.resize(static_cast<std::size_t>(bin_count));
+  struct BinSamples {
+    std::vector<double> center_x;
+    std::vector<double> center_y;
+    std::array<std::vector<double>, 4> corner_x;
+    std::array<std::vector<double>, 4> corner_y;
+  };
+  std::vector<BinSamples> accumulated(static_cast<std::size_t>(bin_count));
+  for (const auto& labeled : samples) {
+    const double phase = wrap_positive(labeled.phase_rad);
+    const double bin_coordinate = phase * bin_count / kTwoPi;
+    const int bin_index = static_cast<int>(std::floor(bin_coordinate + 0.5)) % bin_count;
+    auto& values = accumulated[static_cast<std::size_t>(bin_index)];
+    const auto& sample = labeled.observation;
+    const cv::Point2d center_residual =
+        cv::Point2d(sample.center) - geometry.point(phase);
+    values.center_x.push_back(center_residual.x);
+    values.center_y.push_back(center_residual.y);
+    for (int corner = 0; corner < 4; ++corner) {
+      const cv::Point2d offset =
+          cv::Point2d(sample.corners[corner]) - cv::Point2d(sample.center);
+      values.corner_x[corner].push_back(offset.x);
+      values.corner_y[corner].push_back(offset.y);
+    }
+  }
+  std::vector<bool> covered(static_cast<std::size_t>(bin_count), false);
+  const int minimum_samples = std::max(1, config.shape_min_samples_per_bin);
+  for (int bin = 0; bin < bin_count; ++bin) {
+    const auto& values = accumulated[static_cast<std::size_t>(bin)];
+    if (static_cast<int>(values.center_x.size()) < minimum_samples) continue;
+    covered[static_cast<std::size_t>(bin)] = true;
+    ++model.covered_bins_;
+    auto& output = model.bins_[static_cast<std::size_t>(bin)];
+    output.center_residual = {median(values.center_x), median(values.center_y)};
+    for (int corner = 0; corner < 4; ++corner) {
+      output.corner_offsets[corner] = {
+          median(values.corner_x[corner]), median(values.corner_y[corner])};
+    }
+  }
+  const int required_coverage = std::clamp(
+      config.shape_min_covered_bins, 1, bin_count);
+  if (model.covered_bins_ < required_coverage) return model;
+  const auto robust_bins = model.bins_;
+  for (int bin = 0; bin < bin_count; ++bin) {
+    if (covered[static_cast<std::size_t>(bin)]) continue;
+    int previous_distance = 1;
+    while (previous_distance < bin_count &&
+           !covered[static_cast<std::size_t>(
+               (bin - previous_distance + bin_count) % bin_count)])
+      ++previous_distance;
+    int next_distance = 1;
+    while (next_distance < bin_count &&
+           !covered[static_cast<std::size_t>((bin + next_distance) % bin_count)])
+      ++next_distance;
+    const int previous = (bin - previous_distance + bin_count) % bin_count;
+    const int next = (bin + next_distance) % bin_count;
+    const double amount = static_cast<double>(previous_distance) /
+                          static_cast<double>(previous_distance + next_distance);
+    auto& output = model.bins_[static_cast<std::size_t>(bin)];
+    output.center_residual = lerp(
+        robust_bins[static_cast<std::size_t>(previous)].center_residual,
+        robust_bins[static_cast<std::size_t>(next)].center_residual, amount);
+    for (int corner = 0; corner < 4; ++corner) {
+      output.corner_offsets[corner] = lerp(
+          robust_bins[static_cast<std::size_t>(previous)].corner_offsets[corner],
+          robust_bins[static_cast<std::size_t>(next)].corner_offsets[corner], amount);
+    }
+  }
+  const int smoothing_radius = std::clamp(
+      config.shape_smoothing_radius_bins, 0, (bin_count - 1) / 2);
+  if (smoothing_radius > 0) {
+    const auto filled_bins = model.bins_;
+    const double weight = 1.0 / (2.0 * smoothing_radius + 1.0);
+    for (int bin = 0; bin < bin_count; ++bin) {
+      auto& output = model.bins_[static_cast<std::size_t>(bin)];
+      output.center_residual = {};
+      output.corner_offsets = {};
+      for (int offset = -smoothing_radius; offset <= smoothing_radius; ++offset) {
+        const int source = (bin + offset + bin_count) % bin_count;
+        output.center_residual +=
+            filled_bins[static_cast<std::size_t>(source)].center_residual * weight;
+        for (int corner = 0; corner < 4; ++corner) {
+          output.corner_offsets[corner] +=
+              filled_bins[static_cast<std::size_t>(source)].corner_offsets[corner] * weight;
+        }
+      }
+    }
+  }
+  model.valid_ = true;
+  return model;
+}
+
 ProjectedArmor PhaseQuadModel::project(int id, double phase,
                                        const AffineGeometry& geometry,
                                        const cv::Point2d& model_offset) const {
@@ -309,6 +544,175 @@ ProjectedArmor PhaseQuadModel::project(int id, double phase,
     output.valid = valid_projected_quad(output.corners);
   }
   return output;
+}
+
+void PhaseQuadModel::write(cv::FileStorage& storage) const {
+  storage << "valid" << static_cast<int>(valid_);
+  storage << "covered_bins" << covered_bins_;
+  storage << "bins" << "[";
+  for (const auto& bin : bins_) {
+    storage << "{";
+    storage << "center_x" << bin.center_residual.x;
+    storage << "center_y" << bin.center_residual.y;
+    for (int corner = 0; corner < 4; ++corner) {
+      storage << ("corner" + std::to_string(corner) + "_x")
+              << bin.corner_offsets[corner].x;
+      storage << ("corner" + std::to_string(corner) + "_y")
+              << bin.corner_offsets[corner].y;
+    }
+    storage << "}";
+  }
+  storage << "]";
+}
+
+PhaseQuadModel PhaseQuadModel::read(const cv::FileNode& node) {
+  if (node.empty() || !node.isMap())
+    throw std::runtime_error("calibration profile has no phase quadrilateral model");
+  PhaseQuadModel model;
+  const int valid = required_int(node, "valid");
+  model.covered_bins_ = required_int(node, "covered_bins");
+  const cv::FileNode bins = node["bins"];
+  if (!bins.isSeq())
+    throw std::runtime_error("calibration profile phase bins are invalid");
+  for (const auto& stored : bins) {
+    if (!stored.isMap())
+      throw std::runtime_error("calibration profile has a malformed phase bin");
+    Bin bin;
+    bin.center_residual.x = required_finite_double(stored, "center_x");
+    bin.center_residual.y = required_finite_double(stored, "center_y");
+    std::array<cv::Point2f, 4> shape{};
+    for (int corner = 0; corner < 4; ++corner) {
+      const std::string prefix = "corner" + std::to_string(corner);
+      bin.corner_offsets[corner].x =
+          required_finite_double(stored, prefix + "_x");
+      bin.corner_offsets[corner].y =
+          required_finite_double(stored, prefix + "_y");
+      shape[corner] = cv::Point2f(bin.corner_offsets[corner]);
+    }
+    if (!valid_projected_quad(shape))
+      throw std::runtime_error("calibration profile has a degenerate phase bin");
+    model.bins_.push_back(bin);
+  }
+  model.valid_ = valid == 1 && !model.bins_.empty() &&
+                 model.covered_bins_ > 0 &&
+                 model.covered_bins_ <= static_cast<int>(model.bins_.size());
+  if (!model.valid_ || valid != 1)
+    throw std::runtime_error("calibration profile phase model is not valid");
+  return model;
+}
+
+void save_calibration_profile(const std::string& path,
+                              const CalibrationProfile& profile) {
+  if (profile.image_size.width <= 0 || profile.image_size.height <= 0 ||
+      profile.sample_count < 5 || !valid_geometry(profile.geometry) ||
+      !profile.phase_quad_model.valid())
+    throw std::runtime_error("cannot save an invalid calibration profile");
+  if (profile.undistorted &&
+      (profile.camera_reference_size.width <= 0 ||
+       profile.camera_reference_size.height <= 0 ||
+       !std::isfinite(profile.camera_matrix(0, 0)) ||
+       !std::isfinite(profile.camera_matrix(1, 1)) ||
+       profile.camera_matrix(0, 0) <= 0.0 ||
+       profile.camera_matrix(1, 1) <= 0.0))
+    throw std::runtime_error("cannot save an invalid camera calibration");
+  cv::FileStorage storage(path, cv::FileStorage::WRITE);
+  if (!storage.isOpened())
+    throw std::runtime_error("cannot create calibration profile: " + path);
+  storage << "version" << profile.version;
+  storage << "image_width" << profile.image_size.width;
+  storage << "image_height" << profile.image_size.height;
+  storage << "undistorted" << static_cast<int>(profile.undistorted);
+  storage << "sample_count" << profile.sample_count;
+  storage << "camera" << "{";
+  storage << "reference_width" << profile.camera_reference_size.width;
+  storage << "reference_height" << profile.camera_reference_size.height;
+  storage << "fx" << profile.camera_matrix(0, 0);
+  storage << "fy" << profile.camera_matrix(1, 1);
+  storage << "cx" << profile.camera_matrix(0, 2);
+  storage << "cy" << profile.camera_matrix(1, 2);
+  storage << "k1" << profile.distortion[0];
+  storage << "k2" << profile.distortion[1];
+  storage << "p1" << profile.distortion[2];
+  storage << "p2" << profile.distortion[3];
+  storage << "k3" << profile.distortion[4];
+  storage << "}";
+  storage << "geometry" << "{";
+  storage << "center_x" << profile.geometry.center.x;
+  storage << "center_y" << profile.geometry.center.y;
+  storage << "axis_cos_x" << profile.geometry.axis_cos.x;
+  storage << "axis_cos_y" << profile.geometry.axis_cos.y;
+  storage << "axis_sin_x" << profile.geometry.axis_sin.x;
+  storage << "axis_sin_y" << profile.geometry.axis_sin.y;
+  storage << "armor_width_scale" << profile.geometry.armor_width_scale;
+  storage << "armor_height_px" << profile.geometry.armor_height_px;
+  storage << "calibration_samples" << profile.geometry.calibration_samples;
+  storage << "calibration_rms_px" << profile.geometry.calibration_rms_px;
+  storage << "}";
+  storage << "phase_quad_model" << "{";
+  profile.phase_quad_model.write(storage);
+  storage << "}";
+}
+
+CalibrationProfile load_calibration_profile(const std::string& path) {
+  cv::FileStorage storage(path, cv::FileStorage::READ);
+  if (!storage.isOpened())
+    throw std::runtime_error("cannot open calibration profile: " + path);
+  CalibrationProfile profile;
+  profile.version = required_int(storage.root(), "version");
+  profile.image_size.width = required_int(storage.root(), "image_width");
+  profile.image_size.height = required_int(storage.root(), "image_height");
+  const int undistorted = required_int(storage.root(), "undistorted");
+  profile.sample_count = required_int(storage.root(), "sample_count");
+  if (undistorted != 0 && undistorted != 1)
+    throw std::runtime_error("calibration profile has invalid undistorted flag");
+  profile.undistorted = undistorted != 0;
+  if (profile.version != CalibrationProfile::kCurrentVersion ||
+      profile.image_size.width <= 0 || profile.image_size.height <= 0 ||
+      profile.sample_count < 5)
+    throw std::runtime_error("unsupported or incomplete calibration profile");
+  const cv::FileNode camera = storage["camera"];
+  if (camera.empty() || !camera.isMap())
+    throw std::runtime_error("calibration camera metadata is missing");
+  profile.camera_reference_size.width = required_int(camera, "reference_width");
+  profile.camera_reference_size.height = required_int(camera, "reference_height");
+  profile.camera_matrix = {
+      required_finite_double(camera, "fx"), 0.0,
+      required_finite_double(camera, "cx"),
+      0.0, required_finite_double(camera, "fy"),
+      required_finite_double(camera, "cy"),
+      0.0, 0.0, 1.0};
+  profile.distortion = {
+      required_finite_double(camera, "k1"),
+      required_finite_double(camera, "k2"),
+      required_finite_double(camera, "p1"),
+      required_finite_double(camera, "p2"),
+      required_finite_double(camera, "k3")};
+  if (profile.undistorted &&
+      (profile.camera_reference_size.width <= 0 ||
+       profile.camera_reference_size.height <= 0 ||
+       profile.camera_matrix(0, 0) <= 0.0 ||
+       profile.camera_matrix(1, 1) <= 0.0))
+    throw std::runtime_error("calibration camera metadata is invalid");
+  const cv::FileNode geometry = storage["geometry"];
+  if (geometry.empty() || !geometry.isMap())
+    throw std::runtime_error("calibration geometry is missing");
+  profile.geometry.center.x = required_finite_double(geometry, "center_x");
+  profile.geometry.center.y = required_finite_double(geometry, "center_y");
+  profile.geometry.axis_cos.x = required_finite_double(geometry, "axis_cos_x");
+  profile.geometry.axis_cos.y = required_finite_double(geometry, "axis_cos_y");
+  profile.geometry.axis_sin.x = required_finite_double(geometry, "axis_sin_x");
+  profile.geometry.axis_sin.y = required_finite_double(geometry, "axis_sin_y");
+  profile.geometry.armor_width_scale =
+      required_finite_double(geometry, "armor_width_scale");
+  profile.geometry.armor_height_px =
+      required_finite_double(geometry, "armor_height_px");
+  profile.geometry.calibration_samples = required_int(geometry, "calibration_samples");
+  profile.geometry.calibration_rms_px =
+      required_finite_double(geometry, "calibration_rms_px");
+  if (!valid_geometry(profile.geometry))
+    throw std::runtime_error("calibration geometry is degenerate");
+  profile.phase_quad_model = PhaseQuadModel::read(storage["phase_quad_model"]);
+  return profile;
 }
 
 RigidArmorSolver::RigidArmorSolver(const Config& config, AffineGeometry geometry,
@@ -442,11 +846,130 @@ ArmorSlotOutput RigidArmorSolver::filter_future_target(
   return filtered;
 }
 
+void RigidArmorSolver::reset_tracking_state() {
+  track_state_ = TrackState::kLost;
+  filter_valid_ = false;
+  track_confirm_hits_ = 0;
+  committed_slot_ = -1;
+  last_timestamp_s_ = 0.0;
+  last_measurement_time_s_ = 0.0;
+  phase_filter_state_ = {0.0, 0.0};
+  phase_filter_covariance_ = cv::Matx22d::eye();
+  phase_ = 0.0;
+  speed_ = 0.0;
+  previous_speed_ = 0.0;
+  acceleration_ = 0.0;
+  missed_frames_ = 0;
+  detection_history_valid_ = false;
+  previous_detection_time_s_ = 0.0;
+  detection_velocity_px_s_ = {};
+  detection_velocity_valid_ = false;
+  detection_history_.clear();
+  display_candidate_slot_ = -1;
+  frames_since_handover_ = 0;
+  handover_events_.clear();
+  physical_speed_samples_.clear();
+  physical_speed_valid_ = false;
+  physical_speed_ = 0.0;
+  physical_acceleration_ = 0.0;
+  rotation_direction_votes_.clear();
+  rotation_direction_valid_ = false;
+  rotation_direction_sign_ = 0;
+  jump_transitions_.clear();
+  future_handover_latched_transition_.reset();
+  future_handover_latch_until_s_ = 0.0;
+  future_target_filter_valid_ = false;
+  future_target_filter_slot_ = -1;
+  future_target_filter_velocity_ = {};
+  committed_mode_ = MotionMode::kInitializing;
+  pending_mode_ = MotionMode::kInitializing;
+  pending_mode_frames_ = 0;
+}
+
+void RigidArmorSolver::initialize_phase_filter(double phase, double timestamp_s) {
+  const double phase_std = config_.phase_kf_initial_phase_std_deg * CV_PI / 180.0;
+  const double speed_std = config_.phase_kf_initial_speed_std_deg_s * CV_PI / 180.0;
+  phase_filter_state_ = {phase, 0.0};
+  phase_filter_covariance_ = cv::Matx22d(
+      phase_std * phase_std, 0.0, 0.0, speed_std * speed_std);
+  filter_valid_ = true;
+  phase_ = phase;
+  speed_ = 0.0;
+  previous_speed_ = 0.0;
+  acceleration_ = 0.0;
+  last_timestamp_s_ = timestamp_s;
+  last_measurement_time_s_ = timestamp_s;
+  missed_frames_ = 0;
+}
+
+void RigidArmorSolver::predict_phase_filter(double dt) {
+  const cv::Matx22d transition(1.0, dt, 0.0, 1.0);
+  const double acceleration_std =
+      config_.phase_kf_accel_noise_std_deg_s2 * CV_PI / 180.0;
+  const double q = acceleration_std * acceleration_std;
+  const double dt2 = dt * dt;
+  const double dt3 = dt2 * dt;
+  const double dt4 = dt2 * dt2;
+  const cv::Matx22d process_noise(
+      0.25 * dt4 * q, 0.5 * dt3 * q,
+      0.5 * dt3 * q, dt2 * q);
+  phase_filter_state_ = transition * phase_filter_state_;
+  phase_filter_covariance_ = transition * phase_filter_covariance_ *
+                             transition.t() + process_noise;
+  const double symmetric = 0.5 * (phase_filter_covariance_(0, 1) +
+                                  phase_filter_covariance_(1, 0));
+  phase_filter_covariance_(0, 0) = std::max(
+      config_.covariance_floor, phase_filter_covariance_(0, 0));
+  phase_filter_covariance_(1, 1) = std::max(
+      config_.covariance_floor, phase_filter_covariance_(1, 1));
+  phase_filter_covariance_(0, 1) = symmetric;
+  phase_filter_covariance_(1, 0) = symmetric;
+  phase_ = phase_filter_state_[0];
+  speed_ = phase_filter_state_[1];
+}
+
+void RigidArmorSolver::update_phase_filter(double measurement,
+                                           double measurement_variance_value,
+                                           double innovation) {
+  (void)measurement;
+  const double innovation_variance = phase_filter_covariance_(0, 0) +
+                                     measurement_variance_value;
+  const cv::Vec2d gain(phase_filter_covariance_(0, 0) / innovation_variance,
+                       phase_filter_covariance_(1, 0) / innovation_variance);
+  phase_filter_state_ += gain * innovation;
+  const cv::Matx22d joseph_left(1.0 - gain[0], 0.0, -gain[1], 1.0);
+  const cv::Matx22d gain_noise(
+      gain[0] * gain[0], gain[0] * gain[1],
+      gain[1] * gain[0], gain[1] * gain[1]);
+  phase_filter_covariance_ =
+      joseph_left * phase_filter_covariance_ * joseph_left.t() +
+      gain_noise * measurement_variance_value;
+  const double symmetric = 0.5 * (phase_filter_covariance_(0, 1) +
+                                  phase_filter_covariance_(1, 0));
+  phase_filter_covariance_(0, 0) = std::max(
+      config_.covariance_floor, phase_filter_covariance_(0, 0));
+  phase_filter_covariance_(1, 1) = std::max(
+      config_.covariance_floor, phase_filter_covariance_(1, 1));
+  phase_filter_covariance_(0, 1) = symmetric;
+  phase_filter_covariance_(1, 0) = symmetric;
+  phase_ = phase_filter_state_[0];
+  speed_ = phase_filter_state_[1];
+}
+
+double RigidArmorSolver::measurement_variance(
+    const ArmorObservation& observation) const {
+  const double quality = std::clamp(static_cast<double>(observation.score), 0.25, 1.0);
+  const double sigma = config_.phase_kf_measurement_std_deg * CV_PI / 180.0 / quality;
+  return sigma * sigma;
+}
+
 MotionMode RigidArmorSolver::classify_mode(double dt) {
   MotionMode candidate;
-  const double speed_deg = std::abs(speed_) * 180.0 / CV_PI;
-  const double acceleration_deg = std::abs(acceleration_) * 180.0 / CV_PI;
-  if (missed_frames_ > config_.max_prediction_frames) candidate = MotionMode::kLost;
+  const double motion_speed = scene_moving_ ? speed_ : 0.0;
+  const double motion_acceleration = scene_moving_ ? acceleration_ : 0.0;
+  const double speed_deg = std::abs(motion_speed) * 180.0 / CV_PI;
+  const double acceleration_deg = std::abs(motion_acceleration) * 180.0 / CV_PI;
+  if (track_state_ == TrackState::kLost) candidate = MotionMode::kLost;
   else if (!scene_moving_ && speed_deg < config_.stationary_speed_deg_s) candidate = MotionMode::kStopped;
   else if (previous_speed_ * speed_ < 0.0 &&
            std::abs(previous_speed_) * 180.0 / CV_PI > config_.stationary_speed_deg_s)
@@ -463,39 +986,6 @@ MotionMode RigidArmorSolver::classify_mode(double dt) {
   return committed_mode_;
 }
 
-double RigidArmorSolver::robust_phase_slope() const {
-  if (phase_samples_.size() < 5) return speed_;
-  auto fit = [&](const std::vector<bool>* keep) {
-    double sw = 0.0, st = 0.0, sp = 0.0, stt = 0.0, stp = 0.0;
-    const double origin = phase_samples_.front().time;
-    for (std::size_t i = 0; i < phase_samples_.size(); ++i) {
-      if (keep && !(*keep)[i]) continue;
-      const double t = phase_samples_[i].time - origin;
-      const double p = phase_samples_[i].phase;
-      sw += 1.0; st += t; sp += p; stt += t * t; stp += t * p;
-    }
-    const double denominator = sw * stt - st * st;
-    return std::abs(denominator) < 1e-9 ? speed_ : (sw * stp - st * sp) / denominator;
-  };
-  double slope = fit(nullptr);
-  const double origin = phase_samples_.front().time;
-  double mean_t = 0.0, mean_p = 0.0;
-  for (const auto& sample : phase_samples_) {
-    mean_t += sample.time - origin;
-    mean_p += sample.phase;
-  }
-  mean_t /= phase_samples_.size(); mean_p /= phase_samples_.size();
-  const double intercept = mean_p - slope * mean_t;
-  std::vector<double> residuals;
-  for (const auto& sample : phase_samples_)
-    residuals.push_back(std::abs(sample.phase - (intercept + slope * (sample.time - origin))));
-  const double mad = median(residuals);
-  std::vector<bool> keep(residuals.size(), true);
-  const double cutoff = std::max(0.035, 3.0 * 1.4826 * mad);
-  for (std::size_t i = 0; i < residuals.size(); ++i) keep[i] = residuals[i] <= cutoff;
-  return fit(&keep);
-}
-
 SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& observations,
                                       double timestamp_s, bool scene_moving) {
   SolverOutput output;
@@ -503,119 +993,246 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
   if (detection_history_valid_ &&
       frames_since_handover_ < std::numeric_limits<int>::max())
     ++frames_since_handover_;
-  double dt = initialized_ ? timestamp_s - last_timestamp_s_ : 1.0 / 30.0;
-  dt = std::clamp(dt, 1e-3, 0.2);
+
+  bool timestamp_gap_reset = false;
+  double dt = 1.0 / 30.0;
+  if (filter_valid_) {
+    const double raw_dt = timestamp_s - last_timestamp_s_;
+    if (!std::isfinite(timestamp_s) || !std::isfinite(raw_dt) ||
+        raw_dt <= 0.0 || raw_dt > config_.tracker_max_dt_s) {
+      reset_tracking_state();
+      timestamp_gap_reset = true;
+    } else {
+      dt = raw_dt;
+    }
+  }
+  if (filter_valid_ && track_state_ == TrackState::kDetecting &&
+      timestamp_s - last_measurement_time_s_ > config_.track_confirm_max_gap_s) {
+    reset_tracking_state();
+  }
+  if (filter_valid_) predict_phase_filter(dt);
   const double prediction_lead_s = config_.prediction_lead_s;
-  const double predicted_phase = phase_ + speed_ * dt;
+  const double predicted_phase = phase_;
+
 
   int best_observation = -1, best_slot = -1;
   int image_candidate_association_slot = -1;
   double image_candidate_association_cost = std::numeric_limits<double>::infinity();
   double best_candidate_phase = predicted_phase;
-  double best_pixel_error = std::numeric_limits<double>::infinity();
   double best_cost = std::numeric_limits<double>::infinity();
-  for (std::size_t observation_index = 0; observation_index < observations.size(); ++observation_index) {
+  double best_innovation = 0.0;
+  double best_innovation_variance = 0.0;
+  double best_measurement_variance = 0.0;
+  double best_nis = std::numeric_limits<double>::infinity();
+  double diagnostic_cost = std::numeric_limits<double>::infinity();
+  double diagnostic_innovation = 0.0;
+  double diagnostic_innovation_variance = 0.0;
+  double diagnostic_nis = std::numeric_limits<double>::infinity();
+  for (std::size_t observation_index = 0;
+       filter_valid_ && observation_index < observations.size();
+       ++observation_index) {
     const auto& observation = observations[observation_index];
     const double measured_ellipse_phase = geometry_.phase_of(observation.center);
+    const double observation_variance = measurement_variance(observation);
+    const bool reacquiring = track_state_ == TrackState::kTempLost;
+    int proposed_switch_slot = -1;
+    if (!reacquiring && committed_slot_ >= 0 &&
+        detection_history_valid_) {
+      const double elapsed = timestamp_s - previous_detection_time_s_;
+      if (elapsed > 1e-4 &&
+          elapsed <= config_.image_prediction_history_timeout_s) {
+        const cv::Point2d displacement =
+            cv::Point2d(observation.center) -
+            cv::Point2d(previous_detection_.center);
+        const double nominal_frame_s = prediction_lead_s /
+            std::max(1, config_.prediction_lead_frames);
+        const double normalized_step =
+            cv::norm(displacement) * nominal_frame_s / elapsed;
+        if (normalized_step >= config_.image_prediction_jump_min_px &&
+            normalized_step <= config_.image_prediction_jump_max_px) {
+          bool direction_consistent = true;
+          const double velocity_length = cv::norm(detection_velocity_px_s_);
+          if (detection_velocity_valid_ && velocity_length > 1.0) {
+            const cv::Point2d motion_direction =
+                detection_velocity_px_s_ * (1.0 / velocity_length);
+            const double displacement_length =
+                std::max(1e-9, cv::norm(displacement));
+            const double direction_cosine =
+                displacement.dot(detection_velocity_px_s_) /
+                (displacement_length * velocity_length);
+            const double exit_progress =
+                (cv::Point2d(previous_detection_.center) - geometry_.center)
+                    .dot(motion_direction);
+            const double entry_progress =
+                (cv::Point2d(observation.center) - geometry_.center)
+                    .dot(motion_direction);
+            direction_consistent =
+                direction_cosine <=
+                    config_.image_prediction_jump_direction_cos_max &&
+                exit_progress > 0.0 && entry_progress < 0.0;
+          }
+          if (direction_consistent) {
+            int slot_step = 1;
+            if (handover_direction_valid_) {
+              slot_step = displacement.dot(forward_handover_direction_) >= 0.0
+                  ? 1 : -1;
+            }
+            proposed_switch_slot = (committed_slot_ + slot_step + 3) % 3;
+          }
+        }
+      }
+    }
     for (int slot = 0; slot < 3; ++slot) {
+      if (committed_slot_ >= 0 && slot != committed_slot_ &&
+          !reacquiring && slot != proposed_switch_slot) continue;
       const double raw_base = measured_ellipse_phase - slot * kTwoPi / 3.0;
       const double candidate_phase = predicted_phase +
           std::remainder(raw_base - predicted_phase, kTwoPi);
-      const cv::Point2d association_center =
-          geometry_.point(predicted_phase + slot * kTwoPi / 3.0);
+      const double projected_phase = predicted_phase + slot * kTwoPi / 3.0;
+      const auto projected_candidate = phase_quad_model_.project(
+          slot + 1, projected_phase,
+          geometry_, model_offset_);
+      const cv::Point2d association_center = projected_candidate.valid
+          ? cv::Point2d(projected_candidate.center)
+          : geometry_.point(projected_phase) + model_offset_;
       const double pixel_error = cv::norm(
           association_center - cv::Point2d(observation.center));
-      const double phase_error = std::abs(candidate_phase - predicted_phase);
-      const double cost = pixel_error + 12.0 * phase_error - 3.0 * observation.score;
-      if (observation_index == 0 && cost < image_candidate_association_cost) {
+      const double innovation = candidate_phase - predicted_phase;
+      const double innovation_variance =
+          phase_filter_covariance_(0, 0) + observation_variance;
+      const double nis = innovation * innovation / innovation_variance;
+      const double normalized_pixel =
+          pixel_error / config_.association_pixel_sigma_px;
+      const double score_penalty = config_.association_score_weight *
+          (1.0 - std::clamp(static_cast<double>(observation.score), 0.0, 1.0));
+      const double switch_penalty =
+          committed_slot_ >= 0 && slot != committed_slot_
+              ? config_.association_slot_switch_penalty
+              : 0.0;
+      const double cost = nis + normalized_pixel * normalized_pixel +
+                          score_penalty + switch_penalty;
+      if (observation_index == 0 &&
+          pixel_error <= config_.max_observation_distance_px &&
+          nis <= config_.phase_nis_gate &&
+          cost < image_candidate_association_cost) {
         image_candidate_association_cost = cost;
         image_candidate_association_slot = slot;
+      }
+      if (cost < diagnostic_cost) {
+        diagnostic_cost = cost;
+        diagnostic_innovation = innovation;
+        diagnostic_innovation_variance = innovation_variance;
+        diagnostic_nis = nis;
+      }
+      if (pixel_error > config_.max_observation_distance_px ||
+          nis > config_.phase_nis_gate) {
+        continue;
       }
       if (cost < best_cost) {
         best_cost = cost; best_observation = static_cast<int>(observation_index);
         best_slot = slot; best_candidate_phase = candidate_phase;
-        best_pixel_error = pixel_error;
+        best_innovation = innovation;
+        best_innovation_variance = innovation_variance;
+        best_measurement_variance = observation_variance;
+        best_nis = nis;
       }
     }
+  }
+  if (best_observation < 0 && std::isfinite(diagnostic_cost)) {
+    best_cost = diagnostic_cost;
+    best_innovation = diagnostic_innovation;
+    best_innovation_variance = diagnostic_innovation_variance;
+    best_nis = diagnostic_nis;
   }
   int candidate_observation = best_observation;
   int accepted_slot = -1;
   bool accepted_measurement = false;
-  const double innovation_limit = config_.max_phase_innovation_deg * CV_PI / 180.0;
-  const bool regular_match = initialized_ && best_observation >= 0 &&
-      best_pixel_error <= config_.max_observation_distance_px &&
-      std::abs(best_candidate_phase - predicted_phase) <= innovation_limit;
-  // Once the scene has stopped, the last moving prediction can be displaced by
-  // braking motion that happened inside the motion-detector hold window. Reacquire
-  // a real observation with a wider one-off gate instead of reporting a false loss.
-  const bool stationary_reacquire = initialized_ && best_observation >= 0 && !scene_moving_ &&
-      best_pixel_error <= 2.5 * config_.max_observation_distance_px &&
-      std::abs(best_candidate_phase - predicted_phase) <= 85.0 * CV_PI / 180.0;
+  const bool regular_match = filter_valid_ && best_observation >= 0;
 
-  if (!initialized_ && !observations.empty()) {
+  if (!filter_valid_ && !observations.empty() && std::isfinite(timestamp_s)) {
     const auto best = std::max_element(observations.begin(), observations.end(),
                                       [](const auto& a, const auto& b) { return a.score < b.score; });
-    phase_ = geometry_.phase_of(best->center);
-    speed_ = 0.0; acceleration_ = 0.0; previous_speed_ = 0.0;
-    initialized_ = true; missed_frames_ = 0; best_observation = static_cast<int>(best - observations.begin());
-    best_slot = 0; best_candidate_phase = phase_;
+    initialize_phase_filter(geometry_.phase_of(best->center), timestamp_s);
+    track_state_ = TrackState::kDetecting;
+    track_confirm_hits_ = 1;
+    best_observation = static_cast<int>(best - observations.begin());
+    best_slot = 0;
+    best_candidate_phase = phase_;
     candidate_observation = best_observation;
     accepted_slot = best_slot;
+    committed_slot_ = accepted_slot;
     accepted_measurement = true;
-    phase_samples_.push_back({timestamp_s, phase_});
-  } else if (regular_match || stationary_reacquire) {
-    const double residual = best_candidate_phase - predicted_phase;
-    previous_speed_ = speed_;
-    const double correction_gain = stationary_reacquire ? 0.85 : config_.phase_gain;
-    phase_ = predicted_phase + correction_gain * residual;
-    if (scene_moving_) {
-      phase_samples_.push_back({timestamp_s, best_candidate_phase});
-      while (!phase_samples_.empty() &&
-             timestamp_s - phase_samples_.front().time > config_.phase_regression_window_s)
-        phase_samples_.pop_front();
-      const double measured_speed = robust_phase_slope();
-      bool accept_measured_speed = true;
-      if (motion_prior_.valid) {
-        const double signed_prior = motion_prior_.phase_direction_sign * motion_prior_.speed_abs_rad_s;
-        accept_measured_speed = measured_speed * signed_prior > 0.0 &&
-            std::abs(measured_speed) >
-                config_.speed_measurement_min_ratio * motion_prior_.speed_abs_rad_s &&
-            std::abs(measured_speed) <
-                config_.speed_measurement_max_ratio * motion_prior_.speed_abs_rad_s;
-        if (std::abs(speed_) < 0.20) speed_ = signed_prior;
-        if (accept_measured_speed)
-          speed_ = (1.0 - config_.speed_gain) * speed_ + config_.speed_gain * measured_speed;
-        speed_ = (1.0 - config_.speed_prior_gain) * speed_ +
-                 config_.speed_prior_gain * signed_prior;
-      } else if (accept_measured_speed) {
-        speed_ = (1.0 - config_.speed_gain) * speed_ + config_.speed_gain * measured_speed;
+    best_cost = 0.0;
+    best_innovation = 0.0;
+    best_innovation_variance = phase_filter_covariance_(0, 0) +
+                               measurement_variance(*best);
+    best_nis = 0.0;
+    if (track_confirm_hits_ >= config_.track_confirm_hits)
+      track_state_ = TrackState::kTracking;
+  } else if (regular_match) {
+    const double measurement_gap_s = timestamp_s - last_measurement_time_s_;
+    if (best_slot != committed_slot_ && !handover_direction_valid_ &&
+        detection_history_valid_) {
+      const cv::Point2d displacement =
+          cv::Point2d(observations[static_cast<std::size_t>(best_observation)].center) -
+          cv::Point2d(previous_detection_.center);
+      const double length = cv::norm(displacement);
+      if (length > 1.0) {
+        forward_handover_direction_ = displacement * (1.0 / length);
+        handover_direction_valid_ = true;
       }
-    } else {
-      phase_samples_.clear();
     }
+    previous_speed_ = speed_;
+    update_phase_filter(best_candidate_phase, best_measurement_variance,
+                        best_innovation);
     const double max_speed = config_.max_abs_speed_deg_s * CV_PI / 180.0;
     speed_ = std::clamp(speed_, -max_speed, max_speed);
+    if (config_.angular_speed_snap_enabled)
+      speed_ = snap_angular_speed(speed_, config_);
+    phase_filter_state_[1] = speed_;
     const double instantaneous_acceleration = (speed_ - previous_speed_) / dt;
     acceleration_ = (1.0 - config_.acceleration_gain) * acceleration_ +
                     config_.acceleration_gain * instantaneous_acceleration;
     missed_frames_ = 0;
     accepted_slot = best_slot;
+    committed_slot_ = accepted_slot;
     accepted_measurement = true;
-  } else if (initialized_) {
-    previous_speed_ = speed_;
-    phase_ = predicted_phase;
-    acceleration_ *= 0.92;
+    last_measurement_time_s_ = timestamp_s;
+    if (track_state_ == TrackState::kDetecting) {
+      track_confirm_hits_ = measurement_gap_s <= config_.track_confirm_max_gap_s
+          ? track_confirm_hits_ + 1
+          : 1;
+      if (track_confirm_hits_ >= config_.track_confirm_hits)
+        track_state_ = TrackState::kTracking;
+    } else {
+      track_state_ = TrackState::kTracking;
+      track_confirm_hits_ = std::max(track_confirm_hits_, config_.track_confirm_hits);
+    }
+  } else if (filter_valid_) {
     ++missed_frames_;
+    const double miss_age_s = timestamp_s - last_measurement_time_s_;
+    if (track_state_ == TrackState::kDetecting &&
+        miss_age_s > config_.track_confirm_max_gap_s) {
+      reset_tracking_state();
+    } else {
+      if (track_state_ == TrackState::kTracking)
+        track_state_ = TrackState::kTempLost;
+      if (track_state_ == TrackState::kTempLost &&
+          miss_age_s > config_.track_lost_timeout_s)
+        reset_tracking_state();
+    }
   }
-  if (initialized_ && !scene_moving_) {
-    speed_ *= 0.68;
-    if (std::abs(speed_) * 180.0 / CV_PI < 0.35 * config_.stationary_speed_deg_s) speed_ = 0.0;
-  } else if (initialized_ && scene_moving_ && motion_prior_.valid && std::abs(speed_) < 0.20) {
-    speed_ = motion_prior_.phase_direction_sign * motion_prior_.speed_abs_rad_s;
+  if (filter_valid_) last_timestamp_s_ = timestamp_s;
+
+  const int previous_display_candidate_slot = display_candidate_slot_;
+  if (image_candidate_association_slot >= 0) {
+    if (display_candidate_slot_ >= 0 &&
+        display_candidate_slot_ != image_candidate_association_slot)
+      frames_since_handover_ = 0;
+    display_candidate_slot_ = image_candidate_association_slot;
+  } else if (accepted_measurement && accepted_slot >= 0) {
+    display_candidate_slot_ = accepted_slot;
   }
-  if (initialized_ && scene_moving_)
-    speed_ = snap_angular_speed(speed_, config_);
-  last_timestamp_s_ = timestamp_s;
 
   // A global image offset may compensate a small static camera/model mismatch,
   // but must never chase the armor tangentially while it rotates.  Otherwise it
@@ -632,19 +1249,59 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
     model_offset_ = limited_step(model_offset_, config_.model_offset_max_magnitude_px);
   }
 
-  const int image_candidate_observation = observations.empty() ? -1 : 0;
-  output.candidate_available = image_candidate_observation >= 0;
+  // Keep detector output and filter assimilation separate. The detector sorts
+  // candidates by confidence, so index zero is the box that the UI follows;
+  // the KF may legitimately accept a different candidate.
+  const int display_observation = observations.empty() ? -1 : 0;
+  const int image_candidate_observation = display_observation;
+  output.candidate_available = display_observation >= 0;
   output.measurement_used = accepted_measurement;
   output.candidate_measurement_used = accepted_measurement &&
-      candidate_observation == image_candidate_observation;
+                                      candidate_observation == display_observation;
   output.measurement_slot_index = accepted_measurement ? accepted_slot : -1;
   output.candidate_association_slot_index = image_candidate_association_slot;
   output.missed_frames = missed_frames_;
   output.phase_rad = phase_;
-  output.angular_speed_rad_s = speed_;
-  output.angular_acceleration_rad_s2 = acceleration_;
-  if (image_candidate_observation >= 0) {
-    output.candidate = observations[static_cast<std::size_t>(image_candidate_observation)];
+  if (physical_speed_valid_ && rotation_direction_valid_)
+    physical_speed_ = std::copysign(std::abs(physical_speed_),
+                                    static_cast<double>(rotation_direction_sign_));
+  output.physical_speed_valid = filter_valid_ && physical_speed_valid_ &&
+      rotation_direction_valid_ &&
+      (track_state_ == TrackState::kTracking ||
+       track_state_ == TrackState::kTempLost);
+  output.angular_speed_rad_s = scene_moving_ && output.physical_speed_valid
+      ? physical_speed_
+      : 0.0;
+  output.angular_acceleration_rad_s2 = scene_moving_ && output.physical_speed_valid
+      ? physical_acceleration_
+      : 0.0;
+  output.track_state = track_state_;
+  output.track_confirmed = track_state_ == TrackState::kTracking ||
+                           track_state_ == TrackState::kTempLost;
+  output.phase_gate_passed = accepted_measurement;
+  output.timestamp_gap_reset = timestamp_gap_reset;
+  output.track_confirm_hits = track_confirm_hits_;
+  output.time_since_measurement_s = filter_valid_
+      ? std::max(0.0, timestamp_s - last_measurement_time_s_)
+      : 0.0;
+  output.phase_variance_rad2 = filter_valid_ ? phase_filter_covariance_(0, 0) : 0.0;
+  output.speed_variance_rad2_s2 = filter_valid_ ? phase_filter_covariance_(1, 1) : 0.0;
+  output.phase_innovation_rad = best_innovation;
+  output.phase_innovation_variance = best_innovation_variance;
+  output.phase_nis = std::isfinite(best_nis) ? best_nis : 0.0;
+  output.association_cost = std::isfinite(best_cost) ? best_cost : 0.0;
+  const double phase_sigma = std::sqrt(std::max(0.0, output.phase_variance_rad2));
+  const double uncertainty_confidence = std::exp(
+      -phase_sigma / std::max(1e-6, 15.0 * CV_PI / 180.0));
+  const double state_confidence = output.track_confirmed ? 1.0 :
+      (track_state_ == TrackState::kDetecting
+           ? static_cast<double>(track_confirm_hits_) /
+                 std::max(1, config_.track_confirm_hits)
+           : 0.0);
+  output.track_confidence = std::clamp(
+      uncertainty_confidence * state_confidence, 0.0, 1.0);
+  if (display_observation >= 0) {
+    output.candidate = observations[static_cast<std::size_t>(display_observation)];
   }
 
   // Predict the next image position of the actually detected light-band pair.
@@ -714,19 +1371,10 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
       return output.image_handover_spatial_vote;
     }
 
-    const int frame_index = cvRound(timestamp_s * motion_prior_.calibration_fps);
-    const bool inside_calibrated_motion =
-        frame_index + config_.prediction_lead_frames >=
-            motion_prior_.handover.first_transition_frame &&
-        frame_index <= motion_prior_.handover.last_active_frame;
-    if (!inside_calibrated_motion) return false;
-
-    const bool cold_start_window =
-        frame_index < motion_prior_.handover.first_transition_frame;
     const bool direction_consistent = velocity_available
         ? detection_velocity_px_s_.dot(
               motion_prior_.handover.forward_direction_image) < 0.0
-        : cold_start_window;
+        : true;
     if (!direction_consistent) return false;
 
     const auto& slot_prior = motion_prior_.handover.slots[
@@ -769,12 +1417,55 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
     output.image_future_handover = true;
     future_handover_slot_step = transition.slot_step;
   };
+  const bool accepted_display_switch = output.candidate_measurement_used &&
+      previous_display_candidate_slot >= 0 && accepted_slot >= 0 &&
+      previous_display_candidate_slot != accepted_slot;
+  const auto maybe_apply_handover_prediction =
+      [&](const ArmorObservation& anchor,
+          const std::optional<JumpTransition>& transition,
+          bool periodic_jump, ArmorObservation* predicted) {
+    if (!scene_moving_ || accepted_display_switch ||
+        timestamp_s > future_handover_latch_until_s_) {
+      future_handover_latched_transition_.reset();
+      future_handover_latch_until_s_ = 0.0;
+    }
+    const bool voted = scene_moving_ &&
+        handover_vote(anchor, transition, periodic_jump);
+    if (voted && transition.has_value()) {
+      future_handover_latched_transition_ = *transition;
+      future_handover_latch_until_s_ =
+          timestamp_s + config_.image_prediction_handover_hold_s;
+    }
+    if (voted && transition.has_value()) {
+      apply_handover_prediction(anchor, *transition, predicted);
+    } else if (scene_moving_ &&
+               future_handover_latched_transition_.has_value() &&
+               timestamp_s <= future_handover_latch_until_s_) {
+      apply_handover_prediction(
+          anchor, *future_handover_latched_transition_, predicted);
+    }
+  };
   if (image_candidate_observation >= 0) {
     const ArmorObservation& current =
         observations[static_cast<std::size_t>(image_candidate_observation)];
-    bool periodic_jump = false;
+    // A display-ID switch is a handover only when the same displayed candidate
+    // also passed the Kalman pixel/NIS gates in this frame.
+    bool periodic_jump = output.candidate_measurement_used &&
+        previous_display_candidate_slot >= 0 && accepted_slot >= 0 &&
+        previous_display_candidate_slot != accepted_slot;
     bool image_gate_passed = true;
-    if (!detection_history_valid_ ||
+    if (periodic_jump) {
+      frames_since_handover_ = 0;
+      if (detection_history_valid_) {
+        int slot_step = (accepted_slot - previous_display_candidate_slot + 3) % 3;
+        if (slot_step == 2) slot_step = -1;
+        if (slot_step != 0) {
+          jump_transitions_.push_back({previous_detection_, current, slot_step});
+          while (jump_transitions_.size() > 12) jump_transitions_.pop_front();
+        }
+      }
+      detection_history_.clear();
+    } else if (!detection_history_valid_ ||
         timestamp_s - previous_detection_time_s_ >
             config_.image_prediction_history_timeout_s) {
       detection_velocity_px_s_ = {};
@@ -813,7 +1504,7 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
               direction_cosine <= config_.image_prediction_jump_direction_cos_max &&
               exit_progress > 0.0 && entry_progress < 0.0;
         }
-        if (plausible_handover) {
+        if (plausible_handover && output.candidate_measurement_used) {
           periodic_jump = true;
           const double displacement_length = cv::norm(displacement);
           int slot_step = 1;
@@ -825,7 +1516,8 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
           }
           if (display_candidate_slot_ < 0)
             display_candidate_slot_ = accepted_slot >= 0 ? accepted_slot : std::max(0, best_slot);
-          display_candidate_slot_ = (display_candidate_slot_ + slot_step + 3) % 3;
+          if (accepted_slot >= 0)
+            display_candidate_slot_ = accepted_slot;
           frames_since_handover_ = 0;
           jump_transitions_.push_back({previous_detection_, current, slot_step});
           while (jump_transitions_.size() > 12) jump_transitions_.pop_front();
@@ -836,6 +1528,67 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
       } else if (normalized_step > config_.image_prediction_max_step_px) {
         image_gate_passed = false;
       }
+    }
+
+    const bool accepted_periodic_event = periodic_jump &&
+        output.candidate_measurement_used;
+    if (accepted_display_switch) {
+      int slot_step = (accepted_slot - previous_display_candidate_slot + 3) % 3;
+      if (slot_step == 2) slot_step = -1;
+      if (slot_step != 0) {
+        rotation_direction_votes_.push_back(slot_step);
+        while (rotation_direction_votes_.size() >
+               static_cast<std::size_t>(config_.physical_direction_window))
+          rotation_direction_votes_.pop_front();
+        int vote_sum = 0;
+        for (const int vote : rotation_direction_votes_) vote_sum += vote;
+        if (rotation_direction_votes_.size() >= 3 && vote_sum != 0) {
+          rotation_direction_sign_ = vote_sum > 0 ? 1 : -1;
+          rotation_direction_valid_ = true;
+        }
+      }
+    }
+    if (accepted_periodic_event) {
+      const int slot_step = accepted_display_switch
+          ? ((accepted_slot - previous_display_candidate_slot + 3) % 3)
+          : 0;
+      handover_events_.push_back({timestamp_s, slot_step});
+      const std::size_t stride = static_cast<std::size_t>(
+          config_.physical_speed_handover_stride);
+      if (handover_events_.size() > stride) {
+        const auto& previous_cycle =
+            handover_events_[handover_events_.size() - 1 - stride];
+        const double interval_s = timestamp_s - previous_cycle.time_s;
+        if (interval_s >= config_.physical_speed_min_interval_s &&
+            interval_s <= config_.physical_speed_max_interval_s) {
+          const double measured_magnitude = (kTwoPi / 3.0) / interval_s;
+          physical_speed_samples_.push_back(measured_magnitude);
+          while (physical_speed_samples_.size() >
+                 static_cast<std::size_t>(config_.physical_speed_window))
+            physical_speed_samples_.pop_front();
+          const double previous_magnitude = std::abs(physical_speed_);
+          const double magnitude = median(std::vector<double>(
+              physical_speed_samples_.begin(),
+              physical_speed_samples_.end()));
+          physical_speed_ = rotation_direction_valid_
+              ? std::copysign(magnitude, static_cast<double>(rotation_direction_sign_))
+              : magnitude;
+          if (physical_speed_valid_) {
+            const double measured_acceleration =
+                (magnitude - previous_magnitude) /
+                std::max(1e-3, interval_s / stride);
+            physical_acceleration_ =
+                (1.0 - config_.physical_speed_acceleration_gain) *
+                    physical_acceleration_ +
+                config_.physical_speed_acceleration_gain *
+                    measured_acceleration;
+          }
+          physical_speed_valid_ = true;
+        }
+      }
+      while (handover_events_.size() > stride +
+             static_cast<std::size_t>(config_.physical_speed_window) + 1)
+        handover_events_.pop_front();
     }
 
     if (image_gate_passed) {
@@ -881,9 +1634,8 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
       for (auto& corner : predicted.corners) corner += cv::Point2f(translation);
 
       const auto transition = select_handover_transition(current);
-      if (handover_vote(current, transition, periodic_jump)) {
-        apply_handover_prediction(current, *transition, &predicted);
-      }
+      maybe_apply_handover_prediction(
+          current, transition, periodic_jump, &predicted);
       if (detection_velocity_valid_ || output.image_future_handover) image_motion_future = predicted;
       previous_detection_ = current;
       previous_detection_time_s_ = timestamp_s;
@@ -908,15 +1660,15 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
       for (auto& corner : predicted.corners)
         corner += cv::Point2f(future_translation);
       const auto transition = select_handover_transition(anchor);
-      if (handover_vote(anchor, transition, false)) {
-        apply_handover_prediction(anchor, *transition, &predicted);
-      }
+      maybe_apply_handover_prediction(
+          anchor, transition, false, &predicted);
       image_motion_future = predicted;
       output.image_prediction_coasting = true;
     }
   }
-  output.detected_slot_index = image_candidate_observation >= 0
-      ? display_candidate_slot_
+  output.detected_slot_index = output.candidate_available
+      ? (image_candidate_association_slot >= 0
+             ? image_candidate_association_slot : committed_slot_)
       : -1;
   output.image_track_age_frames = frames_since_handover_;
   const auto projected = project_all(phase_);
@@ -927,17 +1679,24 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
   }
   const double orientation = geometry_.axis_cos.x * geometry_.axis_sin.y -
                              geometry_.axis_cos.y * geometry_.axis_sin.x;
-  const double image_clockwise_speed = speed_ * (orientation >= 0.0 ? 1.0 : -1.0);
-  if (std::abs(speed_) * 180.0 / CV_PI < config_.stationary_speed_deg_s) output.direction = "STOP";
+  const double image_clockwise_speed = output.angular_speed_rad_s *
+      (orientation >= 0.0 ? 1.0 : -1.0);
+  if (!scene_moving_) output.direction = "STOP";
+  else if (!output.physical_speed_valid) output.direction = "UNKNOWN";
+  else if (std::abs(output.angular_speed_rad_s) * 180.0 / CV_PI <
+           config_.stationary_speed_deg_s) output.direction = "STOP";
   else output.direction = image_clockwise_speed > 0.0 ? "CW" : "CCW";
   if (accepted_measurement && committed_mode_ == MotionMode::kLost) {
     committed_mode_ = MotionMode::kInitializing;
     pending_mode_ = MotionMode::kInitializing;
     pending_mode_frames_ = 0;
   }
-  output.mode = initialized_ ? classify_mode(dt) : MotionMode::kInitializing;
-  output.model_valid = initialized_ &&
-                       missed_frames_ <= config_.max_prediction_frames;
+  output.mode = output.track_confirmed
+      ? classify_mode(dt)
+      : (track_state_ == TrackState::kLost
+             ? MotionMode::kLost
+             : MotionMode::kInitializing);
+  output.model_valid = output.track_confirmed;
   output.prediction_lead_frames = config_.prediction_lead_frames;
   output.prediction_lead_s = prediction_lead_s;
   double prediction_acceleration = 0.0;
@@ -961,7 +1720,7 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
     diagnostic.corners = future_projected[static_cast<std::size_t>(slot)].corners;
   }
   const bool current_model_visible = output.model_valid &&
-      missed_frames_ <= config_.prediction_display_max_missed_frames;
+      output.time_since_measurement_s <= config_.track_prediction_visible_s;
   for (int slot = 0; slot < 3; ++slot)
     output.slots[static_cast<std::size_t>(slot)].id = slot + 1;
   if (current_model_visible) {

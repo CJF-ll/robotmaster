@@ -38,10 +38,19 @@ Config Config::load(const std::string& path) {
   READ(shape_phase_bins); READ(shape_min_samples_per_bin); READ(shape_min_covered_bins);
   READ(shape_smoothing_radius_bins); READ(model_offset_gain);
   READ(model_offset_max_step_px); READ(model_offset_max_magnitude_px);
-  READ(max_observation_distance_px); READ(phase_gain); READ(speed_gain);
-  READ(speed_prior_gain); READ(speed_measurement_min_ratio); READ(speed_measurement_max_ratio);
-  READ(acceleration_gain); READ(phase_regression_window_s); READ(max_phase_innovation_deg);
+  READ(max_observation_distance_px); READ(acceleration_gain);
   READ(max_abs_speed_deg_s);
+  READ(track_confirm_hits); READ(track_confirm_max_gap_s);
+  READ(track_prediction_visible_s); READ(track_lost_timeout_s);
+  READ(tracker_max_dt_s); READ(phase_kf_measurement_std_deg);
+  READ(phase_kf_initial_phase_std_deg); READ(phase_kf_initial_speed_std_deg_s);
+  READ(phase_kf_accel_noise_std_deg_s2); READ(phase_nis_gate);
+  READ(association_pixel_sigma_px); READ(association_score_weight);
+  READ(association_slot_switch_penalty); READ(covariance_floor);
+  READ(physical_speed_handover_stride); READ(physical_speed_window);
+  READ(physical_direction_window);
+  READ(physical_speed_min_interval_s); READ(physical_speed_max_interval_s);
+  READ(physical_speed_acceleration_gain);
   int angular_speed_snap_enabled_int = 0;
   if (!fs["angular_speed_snap_enabled"].empty())
     fs["angular_speed_snap_enabled"] >> angular_speed_snap_enabled_int;
@@ -49,10 +58,8 @@ Config Config::load(const std::string& path) {
     throw std::runtime_error("angular_speed_snap_enabled must be 0 or 1");
   c.angular_speed_snap_enabled = angular_speed_snap_enabled_int != 0;
   READ(angular_speed_snap_rad_s); READ(angular_speed_snap_tolerance_rad_s);
-  READ(max_prediction_frames);
   READ(prediction_lead_frames); READ(prediction_lead_s);
   READ(prediction_max_acceleration_deg_s2);
-  READ(prediction_display_max_missed_frames);
   int future_target_filter_enabled_int =
       c.future_target_filter_enabled ? 1 : 0;
   if (!fs["future_target_filter_enabled"].empty())
@@ -74,6 +81,7 @@ Config Config::load(const std::string& path) {
   READ(prediction_overlap_alpha);
   READ(image_prediction_window_frames); READ(image_prediction_min_samples);
   READ(image_prediction_velocity_gain); READ(image_prediction_history_timeout_s);
+  READ(image_prediction_handover_hold_s);
   READ(image_prediction_max_step_px);
   READ(image_prediction_jump_min_px);
   READ(image_prediction_jump_max_px);
@@ -89,13 +97,8 @@ Config Config::load(const std::string& path) {
     throw std::runtime_error("image_prediction_handover_prior_enabled must be 0 or 1");
   c.image_prediction_handover_prior_enabled = image_prediction_handover_prior_enabled_int != 0;
   READ(image_prediction_handover_vote_threshold);
-  READ(image_prediction_handover_training_max_age_frames);
-  READ(image_prediction_handover_min_transitions_per_slot);
-  READ(image_prediction_handover_age_weight_max_px);
-  READ(image_prediction_handover_age_weight_step_px);
   READ(stationary_speed_deg_s); READ(uniform_acceleration_deg_s2); READ(mode_hold_frames);
   READ(motion_difference_threshold); READ(motion_hold_frames);
-  READ(period_search_min_s); READ(period_search_max_s);
 #undef READ
   if (c.solver_mode != "affine" && c.solver_mode != "auto" && c.solver_mode != "pnp")
     throw std::runtime_error("solver_mode must be affine, auto, or pnp");
@@ -119,6 +122,10 @@ Config Config::load(const std::string& path) {
   if (c.solver_mode == "pnp" &&
       (c.armor_width_m <= 0 || c.armor_height_m <= 0 || c.rotation_radius_m <= 0))
     throw std::runtime_error("pnp requires positive physical dimensions");
+  if (c.geometry_calibration_stride < 1 || c.ellipse_ransac_iterations < 1 ||
+      !finite(c.ellipse_inlier_threshold) || c.ellipse_inlier_threshold <= 0 ||
+      c.min_geometry_samples < 5)
+    throw std::runtime_error("invalid geometry-calibration parameters");
   if (!finite(c.max_abs_speed_deg_s) || c.max_abs_speed_deg_s <= 0 ||
       !finite(c.angular_speed_snap_rad_s) || c.angular_speed_snap_rad_s < 0 ||
       !finite(c.angular_speed_snap_tolerance_rad_s) ||
@@ -127,8 +134,34 @@ Config Config::load(const std::string& path) {
       (c.angular_speed_snap_enabled &&
        c.angular_speed_snap_rad_s > c.max_abs_speed_deg_s * CV_PI / 180.0))
     throw std::runtime_error("invalid angular-speed constraints");
-  if (c.max_prediction_frames < 0)
-    throw std::runtime_error("max_prediction_frames must be non-negative");
+  if (c.track_confirm_hits < 1 ||
+      !finite(c.track_confirm_max_gap_s) || c.track_confirm_max_gap_s <= 0 ||
+      !finite(c.track_prediction_visible_s) || c.track_prediction_visible_s < 0 ||
+      !finite(c.track_lost_timeout_s) ||
+      c.track_lost_timeout_s < c.track_prediction_visible_s ||
+      !finite(c.tracker_max_dt_s) || c.tracker_max_dt_s <= 0 ||
+      c.track_confirm_max_gap_s > c.tracker_max_dt_s ||
+      !finite(c.phase_kf_measurement_std_deg) || c.phase_kf_measurement_std_deg <= 0 ||
+      !finite(c.phase_kf_initial_phase_std_deg) || c.phase_kf_initial_phase_std_deg <= 0 ||
+      !finite(c.phase_kf_initial_speed_std_deg_s) || c.phase_kf_initial_speed_std_deg_s <= 0 ||
+      !finite(c.phase_kf_accel_noise_std_deg_s2) || c.phase_kf_accel_noise_std_deg_s2 <= 0 ||
+      !finite(c.phase_nis_gate) || c.phase_nis_gate <= 0 ||
+      !finite(c.association_pixel_sigma_px) || c.association_pixel_sigma_px <= 0 ||
+      !finite(c.association_score_weight) || c.association_score_weight < 0 ||
+      !finite(c.association_slot_switch_penalty) || c.association_slot_switch_penalty < 0 ||
+      !finite(c.covariance_floor) || c.covariance_floor <= 0)
+    throw std::runtime_error("invalid tracking-filter parameters");
+  if (c.physical_speed_handover_stride < 1 ||
+      c.physical_speed_window < 1 || c.physical_speed_window > 31 ||
+      c.physical_direction_window < 5 || c.physical_direction_window > 120 ||
+      !finite(c.physical_speed_min_interval_s) ||
+      c.physical_speed_min_interval_s <= 0 ||
+      !finite(c.physical_speed_max_interval_s) ||
+      c.physical_speed_max_interval_s <= c.physical_speed_min_interval_s ||
+      !finite(c.physical_speed_acceleration_gain) ||
+      c.physical_speed_acceleration_gain <= 0 ||
+      c.physical_speed_acceleration_gain > 1)
+    throw std::runtime_error("invalid physical-speed estimator parameters");
   if (c.quad_end_padding_ratio < 0 || c.quad_end_padding_min_px < 0 ||
       c.quad_side_padding_ratio < 0 || c.quad_side_padding_min_px < 0 ||
       c.quad_min_area_ratio <= 0 || c.quad_min_opposite_edge_ratio <= 0 ||
@@ -146,8 +179,6 @@ Config Config::load(const std::string& path) {
       c.prediction_lead_s < 0 ||
       !finite(c.prediction_max_acceleration_deg_s2) ||
       c.prediction_max_acceleration_deg_s2 < 0 ||
-      c.prediction_display_max_missed_frames < 0 ||
-      c.prediction_display_max_missed_frames > c.max_prediction_frames ||
       !finite(c.future_target_filter_position_gain) ||
       c.future_target_filter_position_gain <= 0 ||
       c.future_target_filter_position_gain > 1 ||
@@ -184,6 +215,9 @@ Config Config::load(const std::string& path) {
       c.image_prediction_velocity_gain < 0 || c.image_prediction_velocity_gain > 1 ||
       !finite(c.image_prediction_history_timeout_s) ||
       c.image_prediction_history_timeout_s <= 0 ||
+      !finite(c.image_prediction_handover_hold_s) ||
+      c.image_prediction_handover_hold_s < c.prediction_lead_s ||
+      c.image_prediction_handover_hold_s > c.track_lost_timeout_s ||
       !finite(c.image_prediction_max_step_px) ||
       c.image_prediction_max_step_px <= 0 ||
       !finite(c.image_prediction_jump_min_px) ||
@@ -198,22 +232,7 @@ Config Config::load(const std::string& path) {
       !finite(c.image_prediction_wrap_margin_px) ||
       c.image_prediction_wrap_margin_px < 0 ||
       c.image_prediction_handover_vote_threshold < 1 ||
-      c.image_prediction_handover_vote_threshold > 3 ||
-      c.image_prediction_handover_training_max_age_frames < 3 ||
-      c.image_prediction_handover_training_max_age_frames > 300 ||
-      c.image_prediction_handover_min_transitions_per_slot < 1 ||
-      !finite(c.image_prediction_handover_age_weight_max_px) ||
-      c.image_prediction_handover_age_weight_max_px < 0 ||
-      !finite(c.image_prediction_handover_age_weight_step_px) ||
-      c.image_prediction_handover_age_weight_step_px <= 0 ||
-      (c.image_prediction_handover_age_weight_max_px > 0 &&
-       c.image_prediction_handover_age_weight_step_px >
-           c.image_prediction_handover_age_weight_max_px) ||
-      (c.image_prediction_handover_age_weight_max_px > 0 &&
-       (!finite(c.image_prediction_handover_age_weight_max_px /
-                c.image_prediction_handover_age_weight_step_px) ||
-        c.image_prediction_handover_age_weight_max_px /
-                c.image_prediction_handover_age_weight_step_px > 100000.0)))
+      c.image_prediction_handover_vote_threshold > 3)
     throw std::runtime_error("invalid image-motion prediction parameters");
   return c;
 }
