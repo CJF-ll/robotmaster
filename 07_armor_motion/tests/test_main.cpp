@@ -156,10 +156,6 @@ void test_config_loading_and_validation() {
     fs << "angular_speed_snap_enabled" << 1;
     fs << "angular_speed_snap_rad_s" << 2.20;
     fs << "angular_speed_snap_tolerance_rad_s" << 0.30;
-    fs << "future_target_filter_enabled" << 1;
-    fs << "future_target_filter_position_gain" << 0.55;
-    fs << "future_target_filter_velocity_gain" << 0.18;
-    fs << "future_target_filter_max_speed_px_s" << 900.0;
     fs << "prediction_overlap_enter_px" << 6.0;
     fs << "prediction_overlap_exit_px" << 10.0;
     fs << "prediction_overlap_enter_iou" << 0.55;
@@ -178,11 +174,6 @@ void test_config_loading_and_validation() {
              std::abs(loaded.angular_speed_snap_rad_s - 2.20) < 1e-9 &&
              std::abs(loaded.angular_speed_snap_tolerance_rad_s - 0.30) < 1e-9,
          "angular-speed snap settings must load from YAML");
-  expect(loaded.future_target_filter_enabled &&
-             std::abs(loaded.future_target_filter_position_gain - 0.55) < 1e-9 &&
-             std::abs(loaded.future_target_filter_velocity_gain - 0.18) < 1e-9 &&
-             std::abs(loaded.future_target_filter_max_speed_px_s - 900.0) < 1e-9,
-         "future-target state-filter gains must load from YAML");
   expect(std::abs(loaded.prediction_overlap_enter_px - 6.0) < 1e-9 &&
              std::abs(loaded.prediction_overlap_exit_px - 10.0) < 1e-9 &&
              std::abs(loaded.prediction_overlap_enter_iou - 0.55) < 1e-9 &&
@@ -211,27 +202,6 @@ void test_config_loading_and_validation() {
   }
   expect_throws([&] { Config::load(temporary.path.string()); },
                 "non-finite image prediction thresholds must be rejected");
-
-  {
-    cv::FileStorage fs(temporary.path.string(), cv::FileStorage::WRITE);
-    fs << "future_target_filter_enabled" << 2;
-  }
-  expect_throws([&] { Config::load(temporary.path.string()); },
-                "non-boolean future-target filter enable must be rejected");
-
-  {
-    cv::FileStorage fs(temporary.path.string(), cv::FileStorage::WRITE);
-    fs << "future_target_filter_position_gain" << 0.0;
-  }
-  expect_throws([&] { Config::load(temporary.path.string()); },
-                "zero future-target position gain must be rejected");
-
-  {
-    cv::FileStorage fs(temporary.path.string(), cv::FileStorage::WRITE);
-    fs << "future_target_filter_max_speed_px_s" << 0.0;
-  }
-  expect_throws([&] { Config::load(temporary.path.string()); },
-                "zero future-target speed limit must be rejected");
 
   {
     cv::FileStorage fs(temporary.path.string(), cv::FileStorage::WRITE);
@@ -274,19 +244,9 @@ void test_config_loading_and_validation() {
              video_config.angular_speed_snap_tolerance_rad_s == 0.0,
          "video config must not carry a disabled preset angular speed");
   expect(std::abs(video_config.image_prediction_history_timeout_s - 0.15) < 1e-9 &&
-             std::abs(video_config.image_prediction_handover_hold_s - 0.90) < 1e-9 &&
              std::abs(video_config.image_prediction_max_step_px - 35.0) < 1e-9 &&
-             std::abs(video_config.image_prediction_jump_max_px - 180.0) < 1e-9 &&
-             !video_config.image_prediction_handover_prior_enabled &&
-             video_config.image_prediction_handover_vote_threshold == 2,
+             std::abs(video_config.image_prediction_jump_max_px - 180.0) < 1e-9,
          "video config must expose the measured image-continuity thresholds");
-  expect(video_config.future_target_filter_enabled &&
-             std::abs(video_config.future_target_filter_position_gain - 0.55) < 1e-9 &&
-             std::abs(video_config.future_target_filter_velocity_gain - 0.08) < 1e-9 &&
-             std::abs(video_config.future_target_filter_shape_gain - 0.45) < 1e-9 &&
-             std::abs(video_config.future_target_filter_reset_distance_px - 60.0) < 1e-9 &&
-             std::abs(video_config.future_target_filter_max_speed_px_s - 1050.0) < 1e-9,
-         "video config must expose the measured continuous prediction filter");
   expect(video_config.track_confirm_hits == 3 &&
              std::abs(video_config.track_prediction_visible_s - 0.90) < 1e-9 &&
              std::abs(video_config.track_lost_timeout_s - 1.50) < 1e-9 &&
@@ -298,6 +258,21 @@ void test_config_loading_and_validation() {
              video_config.physical_speed_window == 5 &&
              video_config.physical_direction_window == 15,
          "video config must expose causal handover-speed estimation parameters");
+}
+
+void test_handover_speed_geometry() {
+  const double one_handover = angular_speed_from_handover_interval(1, 1.0);
+  expect(std::abs(one_handover - 2.0 * CV_PI / 3.0) < 1e-12,
+         "one adjacent three-armor handover must represent 120 degrees");
+  const double three_handovers = angular_speed_from_handover_interval(3, 2.5);
+  expect(std::abs(three_handovers - 0.8 * CV_PI) < 1e-12,
+         "three handovers must accumulate 360 degrees before division by time");
+  expect_throws(
+      [] { (void)angular_speed_from_handover_interval(0, 1.0); },
+      "a speed estimate without handover events must be rejected");
+  expect_throws(
+      [] { (void)angular_speed_from_handover_interval(1, 0.0); },
+      "a speed estimate with a non-positive interval must be rejected");
 }
 
 void test_no_speed_prior_injection() {
@@ -376,18 +351,16 @@ void test_robust_image_velocity_prediction() {
     output = solver.update({observation}, times[i], true);
   }
 
-  expect(output.image_motion_prediction_used,
-         "five valid centers must enable image-motion prediction");
+  expect(output.image_candidate_used,
+         "five accepted centers must update the auxiliary continuity history");
   expect(output.future_target.valid,
-         "robust image-motion prediction must produce a future target");
-  const double expected_future_x = output.candidate.center.x +
-      velocity_x_px_s * config.prediction_lead_s;
-  expect(std::abs(output.future_target.center.x - expected_future_x) < 0.75,
-         "Theil-Sen velocity must preserve the constant trend despite one outlier");
-  expect(std::abs(output.future_target.center.y - output.candidate.center.y) < 0.25,
-         "a horizontal robust track must not invent vertical velocity");
-  expect(output.future_target.center.x > output.candidate.center.x + 4.0F,
-         "future target must advance with the robust trend, not the last outlier step");
+         "the unified phase model must produce a future target");
+  expect(!output.image_motion_prediction_used,
+         "image velocity must not own the final future-target geometry");
+  const auto& phase_target = output.future_model_slots[
+      static_cast<std::size_t>(output.future_slot_index)];
+  expect(cv::norm(output.raw_future_target.center - phase_target.center) < 0.01,
+         "the raw future target must come from the shared future phase");
 
   const ArmorObservation rejected =
       translated_observation(phase_samples.front(), {0.0F, 100.0F});
@@ -396,25 +369,24 @@ void test_robust_image_velocity_prediction() {
          "a medium vertical outlier must fail the state-assimilation gate");
   expect(!gated.image_candidate_used && !gated.image_handover_detected,
          "a 100 px off-trajectory outlier must not be classified as a handover");
-  expect(gated.image_motion_prediction_used && gated.image_prediction_coasting,
-         "a gated candidate must coast only on the previously accepted image velocity");
-  const double gated_future_x = phase_samples.front().center.x +
-      velocity_x_px_s * (0.150 + config.prediction_lead_s);
-  expect(std::abs(gated.future_target.center.x - gated_future_x) < 0.75,
-         "the rejected candidate must not contaminate trusted short-term extrapolation");
+  expect(!gated.image_motion_prediction_used,
+         "a gated candidate must not activate a second future-target state");
+  expect(gated.detected_slot_index == -1,
+         "a rejected candidate must not be exposed as an observed slot");
 
   const ArmorObservation resumed = translated_observation(
       phase_samples.front(), {static_cast<float>(velocity_x_px_s * 0.160), 0.0F});
   const SolverOutput after_gate = solver.update({resumed}, 0.160, true);
-  expect(after_gate.measurement_used && after_gate.image_motion_prediction_used,
-         "the accepted track must resume image prediction after a gated outlier");
+  expect(after_gate.measurement_used && !after_gate.image_motion_prediction_used,
+         "the accepted track must remain on unified phase prediction after a gated outlier");
   expect(after_gate.image_candidate_used, "the resumed image track must pass continuity gating");
   expect(!after_gate.image_prediction_coasting,
          "an accepted measurement must leave coasting mode immediately");
-  const double resumed_future_x = after_gate.candidate.center.x +
-      velocity_x_px_s * config.prediction_lead_s;
-  expect(std::abs(after_gate.future_target.center.x - resumed_future_x) < 0.75,
-         "a gated outlier must not contaminate the accepted velocity history");
+  const auto& resumed_phase_target = after_gate.future_model_slots[
+      static_cast<std::size_t>(after_gate.future_slot_index)];
+  expect(cv::norm(after_gate.raw_future_target.center -
+                  resumed_phase_target.center) < 0.01,
+         "a gated outlier must not replace the phase-projected future target");
 
   const int age_before_timeout = after_gate.image_track_age_frames;
   const ArmorObservation after_timeout_observation = translated_observation(
@@ -437,12 +409,6 @@ void test_continuous_future_filter_and_render_hysteresis() {
   config.image_prediction_window_frames = 5;
   config.image_prediction_min_samples = 3;
   config.image_prediction_velocity_gain = 1.0;
-  config.future_target_filter_enabled = true;
-  config.future_target_filter_position_gain = 0.55;
-  config.future_target_filter_velocity_gain = 0.08;
-  config.future_target_filter_shape_gain = 0.45;
-  config.future_target_filter_reset_distance_px = 60.0;
-  config.future_target_filter_max_dt_s = 0.20;
 
   AffineGeometry geometry;
   geometry.center = {100, 90};
@@ -454,8 +420,6 @@ void test_continuous_future_filter_and_render_hysteresis() {
   MotionPrior prior;
   RigidArmorSolver solver(config, geometry, shape, prior);
 
-  std::vector<double> raw_x;
-  std::vector<double> filtered_x;
   for (int frame = 0; frame < 14; ++frame) {
     const float jitter = frame % 2 == 0 ? -3.5F : 3.5F;
     const cv::Point2f translation(
@@ -474,30 +438,13 @@ void test_continuous_future_filter_and_render_hysteresis() {
     expect(observed != output.slots.end() &&
                cv::norm(observed->center - observation.center) < 0.01,
            "future filtering must never move the green detector box");
-    if (frame >= 4 && output.image_motion_prediction_used) {
-      expect(output.raw_future_target.valid && output.future_target.valid &&
-                 output.future_target_filter_used,
-             "enabled continuous filtering must expose raw and filtered targets");
-      expect(cv::norm(output.future_target_filter_velocity_px_s) <=
-                 config.future_target_filter_max_speed_px_s + 1e-6,
-             "future-target filter velocity must stay inside its configured bound");
-      raw_x.push_back(output.raw_future_target.center.x);
-      filtered_x.push_back(output.future_target.center.x);
-    }
+    if (frame >= 4 && output.raw_future_target.valid)
+      expect(output.future_target.valid &&
+                 !output.future_target_filter_used &&
+                 cv::norm(output.future_target.center -
+                          output.raw_future_target.center) < 0.01,
+             "production prediction must expose the unified phase target without a second filter");
   }
-  expect(raw_x.size() >= 7,
-         "continuous filter test needs enough image-motion predictions");
-  double raw_second_difference = 0.0;
-  double filtered_second_difference = 0.0;
-  for (std::size_t index = 2; index < raw_x.size(); ++index) {
-    raw_second_difference += std::abs(
-        raw_x[index] - 2.0 * raw_x[index - 1] + raw_x[index - 2]);
-    filtered_second_difference += std::abs(
-        filtered_x[index] - 2.0 * filtered_x[index - 1] +
-        filtered_x[index - 2]);
-  }
-  expect(filtered_second_difference < raw_second_difference,
-         "alpha-beta prediction state must reduce frame-to-frame acceleration jitter");
 
   SolverOutput render_output;
   render_output.candidate_available = true;
@@ -566,11 +513,6 @@ void test_periodic_handover_identity_and_future_id() {
   config.image_prediction_jump_min_px = 60.0;
   config.image_prediction_jump_max_px = 180.0;
   config.image_prediction_jump_direction_cos_max = -0.5;
-  config.image_prediction_transition_y_tolerance_px = 8.0;
-  config.image_prediction_wrap_margin_px = 8.0;
-  config.future_target_filter_enabled = true;
-  config.future_target_filter_position_gain = 0.55;
-  config.future_target_filter_velocity_gain = 0.08;
 
   AffineGeometry geometry;
   geometry.center = {100, 90};
@@ -597,75 +539,21 @@ void test_periodic_handover_identity_and_future_id() {
   expect(state.detected_slot_index == 1,
          "the first confirmed handover must atomically advance A1 to A2");
   expect(state.image_track_age_frames == 0, "a confirmed handover must reset track age");
-  expect(state.future_target_filter_reset &&
-             cv::norm(state.future_target.center -
-                      state.raw_future_target.center) < 0.01,
-         "a physical armor-ID change must atomically reset the prediction state");
+  expect(cv::norm(state.future_target.center -
+                  state.raw_future_target.center) < 0.01,
+         "a physical armor-ID change must keep the single phase prediction state");
 
   const std::array<float, 4> next_approach{120.0F, 100.0F, 80.0F, 65.0F};
-  bool future_handover_reset = false;
   for (std::size_t i = 0; i < next_approach.size(); ++i) {
     state = solver.update({at_x(next_approach[i])}, (5.0 + i) / 30.0, true);
-    if (state.image_future_handover && state.future_target_filter_reset) {
-      future_handover_reset =
-          cv::norm(state.future_target.center -
-                   state.raw_future_target.center) < 0.01;
-    }
   }
-  expect(state.image_future_handover && state.image_motion_prediction_used,
-         "learned exit/entry geometry must predict an imminent handover");
-  expect(state.detected_slot_index == 1 && state.future_target.id == 3,
-         "current A2 must remain stable while the future target advances to A3");
-  expect(future_handover_reset,
-         "future handover must jump directly to the next real armor, never interpolate");
-}
-
-void test_learned_handover_cold_start() {
-  Config config;
-  config.shape_phase_bins = 36;
-  config.shape_min_samples_per_bin = 1;
-  config.shape_min_covered_bins = 12;
-  config.shape_smoothing_radius_bins = 2;
-  config.max_observation_distance_px = 1000.0;
-  config.prediction_lead_frames = 3;
-  config.prediction_lead_s = 0.10;
-  config.image_prediction_handover_prior_enabled = true;
-  config.image_prediction_handover_vote_threshold = 2;
-
-  AffineGeometry geometry;
-  geometry.center = {100, 90};
-  geometry.axis_cos = {42, 0};
-  geometry.axis_sin = {0, 24};
-  const auto phase_samples = synthetic_phase_samples(geometry);
-  const PhaseQuadModel shape = calibrate_phase_quad_model(phase_samples, geometry, config);
-  const auto at_x = [&](float x) {
-    return translated_observation(
-        phase_samples.front(), {x - phase_samples.front().center.x, 0.0F});
-  };
-
-  MotionPrior prior;
-  prior.handover.valid = true;
-  prior.handover.forward_direction_image = {1.0, 0.0};
-  for (auto& slot : prior.handover.slots) {
-    slot.valid = true;
-    slot.transition_samples = 3;
-    slot.exit_template = at_x(60.0F);
-    slot.entry_template = at_x(140.0F);
-    slot.progress_age_weight_px = 0.0;
-    slot.progress_threshold = 70.0;
-    slot.age_threshold_frames = 0;
-  }
-
-  const SolverOutput output =
-      RigidArmorSolver(config, geometry, shape, prior).update({at_x(65.0F)}, 0.0, true);
-  expect(output.image_future_handover && output.image_handover_vote_count == 2,
-         "calibrated progress and age votes must support the first handover without velocity");
-  expect(output.image_handover_progress_vote && output.image_handover_age_vote &&
-             !output.image_handover_spatial_vote,
-         "cold-start handover must not invent a spatial vote without image velocity");
-  expect(output.future_target.valid && output.future_target.id == 2 &&
-             std::abs(output.future_target.center.x - 140.0F) < 0.5F,
-         "cold-start handover must use the learned next-armor entry template and ID");
+  expect(!state.image_motion_prediction_used,
+         "image-space history must not own final prediction geometry");
+  expect(state.detected_slot_index == 1 && state.future_target.id == 2,
+         "current A2 and its future projection must keep one physical identity");
+  expect(cv::norm(state.raw_future_target.center -
+                  state.future_model_slots[1].center) < 0.01,
+         "handover templates must not override the shared future-phase projection");
 }
 
 void test_candidate_measurement_semantics() {
@@ -699,7 +587,13 @@ void test_candidate_measurement_semantics() {
              !split_candidate.candidate_measurement_used,
          "phase use of a secondary candidate must not label the displayed candidate USED");
   expect(cv::norm(split_candidate.candidate.center - display_outlier.center) < 0.1,
-         "the green candidate must remain the detector's highest-confidence observation");
+         "raw candidate diagnostics must retain the detector's highest-confidence observation");
+  const auto observed = std::find_if(
+      split_candidate.slots.begin(), split_candidate.slots.end(),
+      [](const ArmorSlotOutput& slot) { return slot.source == BoxSource::kObserved; });
+  expect(observed != split_candidate.slots.end() &&
+             cv::norm(observed->center - phase_match.center) < 0.1,
+         "the visible observed slot must follow the accepted secondary candidate");
 }
 
 void test_phase_quad_model_and_render_sources() {
@@ -772,19 +666,19 @@ void test_phase_quad_model_and_render_sources() {
   const SolverOutput gated = solver.update({samples[36]}, 2.0 / 30.0, true);
   expect(gated.candidate_available && !gated.measurement_used,
          "an out-of-gate light-band quad must remain a visible current candidate");
-  expect(gated.detected_slot_index == handover.measurement_slot_index,
-         "a gated candidate must keep the last accepted fixed ID instead of jittering");
+  expect(gated.detected_slot_index == -1,
+         "a gated candidate must not masquerade as an accepted observed slot");
   expect(cv::norm(gated.candidate.center - samples[36].center) < 0.1,
          "gating must not replace the current detector quadrilateral with a model box");
   expect(!gated.image_motion_prediction_used,
          "a gated candidate must not update the trusted image-motion predictor");
-  expect(!gated.image_prediction_coasting,
-         "coasting requires a previously valid image velocity");
+  expect(!gated.image_motion_prediction_used,
+         "a gated candidate must keep the final prediction on the phase model");
   detected_now = 0;
   for (const auto& slot : gated.slots)
     detected_now += slot.valid && slot.source == BoxSource::kObserved;
-  expect(detected_now == 1,
-         "a gated current detection must remain the exact visible green recognition box");
+  expect(detected_now == 0,
+         "a gated current detection must remain diagnostic instead of becoming a green observed box");
   expect(gated.future_target.valid,
          "a gated current detection must retain a separate future target");
 
@@ -1097,11 +991,11 @@ int main() {
     test_config_loading_and_validation();
     test_light_band_quad();
     test_single_light_is_not_full_armor();
+    test_handover_speed_geometry();
     test_no_speed_prior_injection();
     test_robust_image_velocity_prediction();
     test_continuous_future_filter_and_render_hysteresis();
     test_periodic_handover_identity_and_future_id();
-    test_learned_handover_cold_start();
     test_candidate_measurement_semantics();
     test_phase_quad_model_and_render_sources();
     test_tracker_lifecycle_uses_elapsed_time();

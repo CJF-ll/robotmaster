@@ -122,17 +122,6 @@ prediction_lead_frames: 3
 prediction_lead_s: 0.0
 prediction_max_acceleration_deg_s2: 300.0
 
-# 红色未来框使用持续的 alpha-beta 预测/校正状态。参数由本视频逐帧回放统计
-# 得到；同一编号内平滑中心和形状，编号切换时直接重置到下一块真实装甲板，
-# 不在两块装甲板之间插值。
-future_target_filter_enabled: 1
-future_target_filter_position_gain: 0.55
-future_target_filter_velocity_gain: 0.08
-future_target_filter_shape_gain: 0.45
-future_target_filter_reset_distance_px: 60.0
-future_target_filter_max_dt_s: 0.20
-future_target_filter_max_speed_px_s: 1050.0
-
 # 红框与绿色观测框重合时始终保留，只切换为较细的半透明虚线。进入和退出
 # 使用不同阈值形成迟滞，避免临界位置逐帧闪烁。
 prediction_overlap_enter_px: 6.0
@@ -150,21 +139,10 @@ image_prediction_window_frames: 5
 image_prediction_min_samples: 3
 image_prediction_velocity_gain: 1.0
 image_prediction_history_timeout_s: 0.15
-# 未来换板一旦由因果证据触发，就保持到真实换板或此超时，避免短暂触发后
-# 红框退回当前装甲再跳走。该时间仅是状态保持上限，不指定换板发生时刻。
-image_prediction_handover_hold_s: 0.90
 image_prediction_max_step_px: 35.0
 image_prediction_jump_min_px: 60.0
 image_prediction_jump_max_px: 180.0
 image_prediction_jump_direction_cos_max: -0.5
-image_prediction_transition_y_tolerance_px: 8.0
-image_prediction_wrap_margin_px: 8.0
-
-# 可选的已标定换板先验。当前关闭；运行时只使用已经发生并通过门控的换板
-# 逐步学习退出/进入模板，不读取未来帧。启用先验时，投票阈值控制需要
-# 同时满足的交接证据数量，仍不包含具体交接帧、绝对坐标或预设角速度。
-image_prediction_handover_prior_enabled: 0
-image_prediction_handover_vote_threshold: 2
 
 stationary_speed_deg_s: 4.0
 uniform_acceleration_deg_s2: 28.0

@@ -101,6 +101,9 @@ void save_calibration_profile(const std::string& path,
                               const CalibrationProfile& profile);
 CalibrationProfile load_calibration_profile(const std::string& path);
 
+double angular_speed_from_handover_interval(std::size_t handover_count,
+                                            double interval_s);
+
 class RigidArmorSolver {
  public:
   RigidArmorSolver(const Config& config, AffineGeometry geometry,
@@ -152,27 +155,10 @@ class RigidArmorSolver {
   std::deque<int> rotation_direction_votes_;
   bool rotation_direction_valid_ = false;
   int rotation_direction_sign_ = 0;
-  struct JumpTransition {
-    ArmorObservation exit;
-    ArmorObservation entry;
-    int slot_step = 1;
-  };
-  std::deque<JumpTransition> jump_transitions_;
-  std::optional<JumpTransition> future_handover_latched_transition_;
-  double future_handover_latch_until_s_ = 0.0;
   bool handover_direction_valid_ = false;
   cv::Point2d forward_handover_direction_{};
-  bool future_target_filter_valid_ = false;
-  int future_target_filter_slot_ = -1;
-  double future_target_filter_time_s_ = 0.0;
-  cv::Point2d future_target_filter_center_{};
-  cv::Point2d future_target_filter_velocity_{};
-  std::array<cv::Point2d, 4> future_target_filter_corner_offsets_{};
 
   std::array<ProjectedArmor, 3> project_all(double base_phase) const;
-  ArmorSlotOutput filter_future_target(const ArmorSlotOutput& raw_target,
-                                       int target_slot, double timestamp_s,
-                                       SolverOutput* diagnostics);
   void reset_tracking_state();
   void initialize_phase_filter(double phase, double timestamp_s);
   void predict_phase_filter(double dt);

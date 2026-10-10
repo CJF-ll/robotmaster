@@ -60,20 +60,6 @@ Config Config::load(const std::string& path) {
   READ(angular_speed_snap_rad_s); READ(angular_speed_snap_tolerance_rad_s);
   READ(prediction_lead_frames); READ(prediction_lead_s);
   READ(prediction_max_acceleration_deg_s2);
-  int future_target_filter_enabled_int =
-      c.future_target_filter_enabled ? 1 : 0;
-  if (!fs["future_target_filter_enabled"].empty())
-    fs["future_target_filter_enabled"] >> future_target_filter_enabled_int;
-  if (future_target_filter_enabled_int != 0 &&
-      future_target_filter_enabled_int != 1)
-    throw std::runtime_error("future_target_filter_enabled must be 0 or 1");
-  c.future_target_filter_enabled = future_target_filter_enabled_int != 0;
-  READ(future_target_filter_position_gain);
-  READ(future_target_filter_velocity_gain);
-  READ(future_target_filter_shape_gain);
-  READ(future_target_filter_reset_distance_px);
-  READ(future_target_filter_max_dt_s);
-  READ(future_target_filter_max_speed_px_s);
   READ(prediction_overlap_enter_px);
   READ(prediction_overlap_exit_px);
   READ(prediction_overlap_enter_iou);
@@ -81,22 +67,10 @@ Config Config::load(const std::string& path) {
   READ(prediction_overlap_alpha);
   READ(image_prediction_window_frames); READ(image_prediction_min_samples);
   READ(image_prediction_velocity_gain); READ(image_prediction_history_timeout_s);
-  READ(image_prediction_handover_hold_s);
   READ(image_prediction_max_step_px);
   READ(image_prediction_jump_min_px);
   READ(image_prediction_jump_max_px);
   READ(image_prediction_jump_direction_cos_max);
-  READ(image_prediction_transition_y_tolerance_px);
-  READ(image_prediction_wrap_margin_px);
-  int image_prediction_handover_prior_enabled_int = 1;
-  if (!fs["image_prediction_handover_prior_enabled"].empty())
-    fs["image_prediction_handover_prior_enabled"] >>
-        image_prediction_handover_prior_enabled_int;
-  if (image_prediction_handover_prior_enabled_int != 0 &&
-      image_prediction_handover_prior_enabled_int != 1)
-    throw std::runtime_error("image_prediction_handover_prior_enabled must be 0 or 1");
-  c.image_prediction_handover_prior_enabled = image_prediction_handover_prior_enabled_int != 0;
-  READ(image_prediction_handover_vote_threshold);
   READ(stationary_speed_deg_s); READ(uniform_acceleration_deg_s2); READ(mode_hold_frames);
   READ(motion_difference_threshold); READ(motion_hold_frames);
 #undef READ
@@ -179,21 +153,6 @@ Config Config::load(const std::string& path) {
       c.prediction_lead_s < 0 ||
       !finite(c.prediction_max_acceleration_deg_s2) ||
       c.prediction_max_acceleration_deg_s2 < 0 ||
-      !finite(c.future_target_filter_position_gain) ||
-      c.future_target_filter_position_gain <= 0 ||
-      c.future_target_filter_position_gain > 1 ||
-      !finite(c.future_target_filter_velocity_gain) ||
-      c.future_target_filter_velocity_gain < 0 ||
-      c.future_target_filter_velocity_gain > 1 ||
-      !finite(c.future_target_filter_shape_gain) ||
-      c.future_target_filter_shape_gain <= 0 ||
-      c.future_target_filter_shape_gain > 1 ||
-      !finite(c.future_target_filter_reset_distance_px) ||
-      c.future_target_filter_reset_distance_px <= 0 ||
-      !finite(c.future_target_filter_max_dt_s) ||
-      c.future_target_filter_max_dt_s <= 0 ||
-      !finite(c.future_target_filter_max_speed_px_s) ||
-      c.future_target_filter_max_speed_px_s <= 0 ||
       !finite(c.prediction_overlap_enter_px) ||
       !finite(c.prediction_overlap_exit_px) ||
       c.prediction_overlap_enter_px < 0 ||
@@ -215,9 +174,6 @@ Config Config::load(const std::string& path) {
       c.image_prediction_velocity_gain < 0 || c.image_prediction_velocity_gain > 1 ||
       !finite(c.image_prediction_history_timeout_s) ||
       c.image_prediction_history_timeout_s <= 0 ||
-      !finite(c.image_prediction_handover_hold_s) ||
-      c.image_prediction_handover_hold_s < c.prediction_lead_s ||
-      c.image_prediction_handover_hold_s > c.track_lost_timeout_s ||
       !finite(c.image_prediction_max_step_px) ||
       c.image_prediction_max_step_px <= 0 ||
       !finite(c.image_prediction_jump_min_px) ||
@@ -226,13 +182,7 @@ Config Config::load(const std::string& path) {
       c.image_prediction_jump_max_px <= c.image_prediction_jump_min_px ||
       !finite(c.image_prediction_jump_direction_cos_max) ||
       c.image_prediction_jump_direction_cos_max < -1.0 ||
-      c.image_prediction_jump_direction_cos_max > 0.0 ||
-      !finite(c.image_prediction_transition_y_tolerance_px) ||
-      c.image_prediction_transition_y_tolerance_px < 0 ||
-      !finite(c.image_prediction_wrap_margin_px) ||
-      c.image_prediction_wrap_margin_px < 0 ||
-      c.image_prediction_handover_vote_threshold < 1 ||
-      c.image_prediction_handover_vote_threshold > 3)
+      c.image_prediction_jump_direction_cos_max > 0.0)
     throw std::runtime_error("invalid image-motion prediction parameters");
   return c;
 }

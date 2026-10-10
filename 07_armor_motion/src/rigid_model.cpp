@@ -123,6 +123,14 @@ bool valid_geometry(const AffineGeometry& geometry) {
 
 }  // namespace
 
+double angular_speed_from_handover_interval(std::size_t handover_count,
+                                            double interval_s) {
+  if (handover_count == 0 || !std::isfinite(interval_s) || interval_s <= 0.0)
+    throw std::invalid_argument("handover interval must be finite and positive");
+  return static_cast<double>(handover_count) * (2.0 * CV_PI / 3.0) /
+         interval_s;
+}
+
 cv::Point2d AffineGeometry::point(double phase) const {
   return center + axis_cos * std::cos(phase) + axis_sin * std::sin(phase);
 }
@@ -747,105 +755,6 @@ std::array<ProjectedArmor, 3> RigidArmorSolver::project_all(double base_phase) c
   return projected;
 }
 
-ArmorSlotOutput RigidArmorSolver::filter_future_target(
-    const ArmorSlotOutput& raw_target, int target_slot, double timestamp_s,
-    SolverOutput* diagnostics) {
-  diagnostics->future_target_filter_used = false;
-  diagnostics->future_target_filter_reset = false;
-  diagnostics->future_target_filter_innovation_px = 0.0;
-  diagnostics->future_target_filter_velocity_px_s = {};
-
-  if (!raw_target.valid || target_slot < 0 || target_slot >= 3) {
-    future_target_filter_valid_ = false;
-    future_target_filter_slot_ = -1;
-    future_target_filter_velocity_ = {};
-    return raw_target;
-  }
-  if (!config_.future_target_filter_enabled) {
-    future_target_filter_valid_ = false;
-    future_target_filter_slot_ = -1;
-    future_target_filter_velocity_ = {};
-    return raw_target;
-  }
-
-  diagnostics->future_target_filter_used = true;
-  const auto reset_filter = [&]() {
-    future_target_filter_valid_ = true;
-    future_target_filter_slot_ = target_slot;
-    future_target_filter_time_s_ = timestamp_s;
-    future_target_filter_center_ = cv::Point2d(raw_target.center);
-    future_target_filter_velocity_ =
-        detection_velocity_valid_ ? detection_velocity_px_s_ : cv::Point2d{};
-    future_target_filter_velocity_ = limited_step(
-        future_target_filter_velocity_,
-        config_.future_target_filter_max_speed_px_s);
-    for (int corner = 0; corner < 4; ++corner) {
-      future_target_filter_corner_offsets_[corner] =
-          cv::Point2d(raw_target.corners[corner]) -
-          cv::Point2d(raw_target.center);
-    }
-    diagnostics->future_target_filter_reset = true;
-    diagnostics->future_target_filter_velocity_px_s =
-        future_target_filter_velocity_;
-    return raw_target;
-  };
-
-  if (!future_target_filter_valid_ ||
-      future_target_filter_slot_ != target_slot) {
-    return reset_filter();
-  }
-  const double filter_dt = timestamp_s - future_target_filter_time_s_;
-  if (!std::isfinite(filter_dt) || filter_dt <= 1e-6 ||
-      filter_dt > config_.future_target_filter_max_dt_s) {
-    return reset_filter();
-  }
-
-  const cv::Point2d predicted_center =
-      future_target_filter_center_ +
-      future_target_filter_velocity_ * filter_dt;
-  const cv::Point2d innovation =
-      cv::Point2d(raw_target.center) - predicted_center;
-  const double innovation_length = cv::norm(innovation);
-  diagnostics->future_target_filter_innovation_px = innovation_length;
-  if (!std::isfinite(innovation_length) ||
-      innovation_length >
-          config_.future_target_filter_reset_distance_px) {
-    return reset_filter();
-  }
-
-  future_target_filter_center_ =
-      predicted_center +
-      innovation * config_.future_target_filter_position_gain;
-  future_target_filter_velocity_ +=
-      innovation *
-      (config_.future_target_filter_velocity_gain / filter_dt);
-  future_target_filter_velocity_ = limited_step(
-      future_target_filter_velocity_,
-      config_.future_target_filter_max_speed_px_s);
-  for (int corner = 0; corner < 4; ++corner) {
-    const cv::Point2d raw_offset =
-        cv::Point2d(raw_target.corners[corner]) -
-        cv::Point2d(raw_target.center);
-    future_target_filter_corner_offsets_[corner] =
-        future_target_filter_corner_offsets_[corner] *
-            (1.0 - config_.future_target_filter_shape_gain) +
-        raw_offset * config_.future_target_filter_shape_gain;
-  }
-  future_target_filter_time_s_ = timestamp_s;
-
-  ArmorSlotOutput filtered = raw_target;
-  filtered.center = cv::Point2f(future_target_filter_center_);
-  for (int corner = 0; corner < 4; ++corner) {
-    filtered.corners[corner] = cv::Point2f(
-        future_target_filter_center_ +
-        future_target_filter_corner_offsets_[corner]);
-  }
-  if (!valid_projected_quad(filtered.corners)) return reset_filter();
-  diagnostics->future_target_filter_velocity_px_s =
-      future_target_filter_velocity_;
-  return filtered;
-}
-
 void RigidArmorSolver::reset_tracking_state() {
   track_state_ = TrackState::kLost;
   filter_valid_ = false;
@@ -875,12 +784,6 @@ void RigidArmorSolver::reset_tracking_state() {
   rotation_direction_votes_.clear();
   rotation_direction_valid_ = false;
   rotation_direction_sign_ = 0;
-  jump_transitions_.clear();
-  future_handover_latched_transition_.reset();
-  future_handover_latch_until_s_ = 0.0;
-  future_target_filter_valid_ = false;
-  future_target_filter_slot_ = -1;
-  future_target_filter_velocity_ = {};
   committed_mode_ = MotionMode::kInitializing;
   pending_mode_ = MotionMode::kInitializing;
   pending_mode_frames_ = 0;
@@ -1034,7 +937,9 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
     const auto& observation = observations[observation_index];
     const double measured_ellipse_phase = geometry_.phase_of(observation.center);
     const double observation_variance = measurement_variance(observation);
-    const bool reacquiring = track_state_ == TrackState::kTempLost;
+    const bool reacquiring = track_state_ == TrackState::kTempLost &&
+        timestamp_s - last_measurement_time_s_ >
+            config_.image_prediction_history_timeout_s;
     int proposed_switch_slot = -1;
     if (!reacquiring && committed_slot_ >= 0 &&
         detection_history_valid_) {
@@ -1225,12 +1130,10 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
   if (filter_valid_) last_timestamp_s_ = timestamp_s;
 
   const int previous_display_candidate_slot = display_candidate_slot_;
-  if (image_candidate_association_slot >= 0) {
+  if (accepted_measurement && accepted_slot >= 0) {
     if (display_candidate_slot_ >= 0 &&
-        display_candidate_slot_ != image_candidate_association_slot)
+        display_candidate_slot_ != accepted_slot)
       frames_since_handover_ = 0;
-    display_candidate_slot_ = image_candidate_association_slot;
-  } else if (accepted_measurement && accepted_slot >= 0) {
     display_candidate_slot_ = accepted_slot;
   }
 
@@ -1249,11 +1152,12 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
     model_offset_ = limited_step(model_offset_, config_.model_offset_max_magnitude_px);
   }
 
-  // Keep detector output and filter assimilation separate. The detector sorts
-  // candidates by confidence, so index zero is the box that the UI follows;
-  // the KF may legitimately accept a different candidate.
+  // Keep the raw detector candidate available for diagnostics, but only an
+  // observation that passed association and NIS gates may drive display IDs,
+  // image history, or the observed green slot.
   const int display_observation = observations.empty() ? -1 : 0;
-  const int image_candidate_observation = display_observation;
+  const int image_candidate_observation = accepted_measurement
+      ? candidate_observation : -1;
   output.candidate_available = display_observation >= 0;
   output.measurement_used = accepted_measurement;
   output.candidate_measurement_used = accepted_measurement &&
@@ -1304,166 +1208,24 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
     output.candidate = observations[static_cast<std::size_t>(display_observation)];
   }
 
-  // Predict the next image position of the actually detected light-band pair.
-  // Phase assimilation and image continuity are deliberately separate: a real
-  // light-band pair may fail the phase gate while still being the best short-
-  // horizon image anchor.  Only candidates that pass this independent gate may
-  // update the robust velocity history or advance the persistent display ID.
-  std::optional<ArmorObservation> image_motion_future;
-  int future_handover_slot_step = 0;
-  const auto select_handover_transition =
-      [&](const ArmorObservation& anchor) -> std::optional<JumpTransition> {
-    if (motion_prior_.handover.valid && display_candidate_slot_ >= 0 &&
-        display_candidate_slot_ < 3) {
-      const auto& slot_prior = motion_prior_.handover.slots[
-          static_cast<std::size_t>(display_candidate_slot_)];
-      if (slot_prior.valid) {
-        return JumpTransition{slot_prior.exit_template,
-                              slot_prior.entry_template, 1};
-      }
-    }
-    if (jump_transitions_.empty()) return std::nullopt;
-    const auto nearest = std::min_element(
-        jump_transitions_.begin(), jump_transitions_.end(),
-        [&](const JumpTransition& first, const JumpTransition& second) {
-          return std::abs(first.exit.center.y - anchor.center.y) <
-                 std::abs(second.exit.center.y - anchor.center.y);
-        });
-    if (nearest == jump_transitions_.end() ||
-        std::abs(nearest->exit.center.y - anchor.center.y) >
-            config_.image_prediction_transition_y_tolerance_px)
-      return std::nullopt;
-    return *nearest;
-  };
-
-  const auto handover_vote = [&](const ArmorObservation& anchor,
-                                 const std::optional<JumpTransition>& transition,
-                                 bool periodic_jump) {
-    output.image_handover_spatial_vote = false;
-    output.image_handover_progress_vote = false;
-    output.image_handover_age_vote = false;
-    output.image_handover_vote_count = 0;
-    if (periodic_jump || !transition.has_value()) return false;
-
-    const double velocity_length = cv::norm(detection_velocity_px_s_);
-    const bool velocity_available =
-        detection_velocity_valid_ && velocity_length > 1.0;
-    if (velocity_available) {
-      const cv::Point2d direction =
-          detection_velocity_px_s_ * (1.0 / velocity_length);
-      const double distance_to_exit =
-          (cv::Point2d(transition->exit.center) - cv::Point2d(anchor.center))
-              .dot(direction);
-      output.image_handover_spatial_vote =
-          std::abs(transition->exit.center.y - anchor.center.y) <=
-              config_.image_prediction_transition_y_tolerance_px &&
-          velocity_length * prediction_lead_s >
-              distance_to_exit + config_.image_prediction_wrap_margin_px;
-    }
-
-    const bool learned_prior_available =
-        config_.image_prediction_handover_prior_enabled &&
-        motion_prior_.handover.valid && display_candidate_slot_ >= 0 &&
-        display_candidate_slot_ < 3;
-    if (!learned_prior_available) {
-      output.image_handover_vote_count =
-          output.image_handover_spatial_vote ? 1 : 0;
-      return output.image_handover_spatial_vote;
-    }
-
-    const bool direction_consistent = velocity_available
-        ? detection_velocity_px_s_.dot(
-              motion_prior_.handover.forward_direction_image) < 0.0
-        : true;
-    if (!direction_consistent) return false;
-
-    const auto& slot_prior = motion_prior_.handover.slots[
-        static_cast<std::size_t>(display_candidate_slot_)];
-    output.image_track_progress = cv::Point2d(anchor.center).dot(
-        motion_prior_.handover.forward_direction_image);
-    const double handover_score = output.image_track_progress -
-        slot_prior.progress_age_weight_px * frames_since_handover_;
-    output.image_handover_progress_vote =
-        handover_score <= slot_prior.progress_threshold;
-    output.image_handover_age_vote =
-        frames_since_handover_ >= slot_prior.age_threshold_frames;
-    output.image_handover_vote_count =
-        static_cast<int>(output.image_handover_spatial_vote) +
-        static_cast<int>(output.image_handover_progress_vote) +
-        static_cast<int>(output.image_handover_age_vote);
-    return output.image_handover_vote_count >=
-        config_.image_prediction_handover_vote_threshold;
-  };
-
-  const auto apply_handover_prediction =
-      [&](const ArmorObservation& anchor, const JumpTransition& transition,
-          ArmorObservation* predicted) {
-    const double velocity_length = cv::norm(detection_velocity_px_s_);
-    cv::Point2d translation{};
-    if (detection_velocity_valid_ && velocity_length > 1.0) {
-      const cv::Point2d direction =
-          detection_velocity_px_s_ * (1.0 / velocity_length);
-      const double distance_to_exit =
-          (cv::Point2d(transition.exit.center) - cv::Point2d(anchor.center))
-              .dot(direction);
-      const double distance_after_entry = std::max(
-          0.0, velocity_length * prediction_lead_s -
-                   std::max(0.0, distance_to_exit));
-      translation = direction * distance_after_entry;
-    }
-    *predicted = transition.entry;
-    predicted->center += cv::Point2f(translation);
-    for (auto& corner : predicted->corners) corner += cv::Point2f(translation);
-    output.image_future_handover = true;
-    future_handover_slot_step = transition.slot_step;
-  };
-  const bool accepted_display_switch = output.candidate_measurement_used &&
+  const bool accepted_display_switch = accepted_measurement &&
       previous_display_candidate_slot >= 0 && accepted_slot >= 0 &&
       previous_display_candidate_slot != accepted_slot;
-  const auto maybe_apply_handover_prediction =
-      [&](const ArmorObservation& anchor,
-          const std::optional<JumpTransition>& transition,
-          bool periodic_jump, ArmorObservation* predicted) {
-    if (!scene_moving_ || accepted_display_switch ||
-        timestamp_s > future_handover_latch_until_s_) {
-      future_handover_latched_transition_.reset();
-      future_handover_latch_until_s_ = 0.0;
-    }
-    const bool voted = scene_moving_ &&
-        handover_vote(anchor, transition, periodic_jump);
-    if (voted && transition.has_value()) {
-      future_handover_latched_transition_ = *transition;
-      future_handover_latch_until_s_ =
-          timestamp_s + config_.image_prediction_handover_hold_s;
-    }
-    if (voted && transition.has_value()) {
-      apply_handover_prediction(anchor, *transition, predicted);
-    } else if (scene_moving_ &&
-               future_handover_latched_transition_.has_value() &&
-               timestamp_s <= future_handover_latch_until_s_) {
-      apply_handover_prediction(
-          anchor, *future_handover_latched_transition_, predicted);
-    }
-  };
+  // Image-space history is retained only as an association aid for deciding
+  // whether a large detector jump is a plausible armor handover.  It no
+  // longer owns a second future-position predictor; all displayed future
+  // geometry comes from the same filtered phase state used for association.
   if (image_candidate_observation >= 0) {
     const ArmorObservation& current =
         observations[static_cast<std::size_t>(image_candidate_observation)];
     // A display-ID switch is a handover only when the same displayed candidate
     // also passed the Kalman pixel/NIS gates in this frame.
-    bool periodic_jump = output.candidate_measurement_used &&
+    bool periodic_jump = accepted_measurement &&
         previous_display_candidate_slot >= 0 && accepted_slot >= 0 &&
         previous_display_candidate_slot != accepted_slot;
     bool image_gate_passed = true;
     if (periodic_jump) {
       frames_since_handover_ = 0;
-      if (detection_history_valid_) {
-        int slot_step = (accepted_slot - previous_display_candidate_slot + 3) % 3;
-        if (slot_step == 2) slot_step = -1;
-        if (slot_step != 0) {
-          jump_transitions_.push_back({previous_detection_, current, slot_step});
-          while (jump_transitions_.size() > 12) jump_transitions_.pop_front();
-        }
-      }
       detection_history_.clear();
     } else if (!detection_history_valid_ ||
         timestamp_s - previous_detection_time_s_ >
@@ -1504,23 +1266,18 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
               direction_cosine <= config_.image_prediction_jump_direction_cos_max &&
               exit_progress > 0.0 && entry_progress < 0.0;
         }
-        if (plausible_handover && output.candidate_measurement_used) {
+        if (plausible_handover && accepted_measurement) {
           periodic_jump = true;
           const double displacement_length = cv::norm(displacement);
-          int slot_step = 1;
           if (!handover_direction_valid_ && displacement_length > 1.0) {
             forward_handover_direction_ = displacement * (1.0 / displacement_length);
             handover_direction_valid_ = true;
-          } else if (handover_direction_valid_) {
-            slot_step = displacement.dot(forward_handover_direction_) >= 0.0 ? 1 : -1;
           }
           if (display_candidate_slot_ < 0)
             display_candidate_slot_ = accepted_slot >= 0 ? accepted_slot : std::max(0, best_slot);
           if (accepted_slot >= 0)
             display_candidate_slot_ = accepted_slot;
           frames_since_handover_ = 0;
-          jump_transitions_.push_back({previous_detection_, current, slot_step});
-          while (jump_transitions_.size() > 12) jump_transitions_.pop_front();
           detection_history_.clear();
         } else {
           image_gate_passed = false;
@@ -1530,13 +1287,17 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
       }
     }
 
-    const bool accepted_periodic_event = periodic_jump &&
-        output.candidate_measurement_used;
+    const bool accepted_periodic_event = accepted_display_switch;
     if (accepted_display_switch) {
-      int slot_step = (accepted_slot - previous_display_candidate_slot + 3) % 3;
-      if (slot_step == 2) slot_step = -1;
-      if (slot_step != 0) {
-        rotation_direction_votes_.push_back(slot_step);
+      // A slot handover only says that 120 degrees have elapsed.  Its slot
+      // index sign is not the sign of the continuous phase state: changing the
+      // representative armor adds/subtracts 120 degrees to keep phase
+      // continuous.  Vote with the already unwrapped phase-filter speed so the
+      // handover-derived magnitude cannot reverse the phase predictor.
+      const double direction_vote_threshold =
+          config_.stationary_speed_deg_s * CV_PI / 180.0;
+      if (std::abs(speed_) >= direction_vote_threshold) {
+        rotation_direction_votes_.push_back(speed_ > 0.0 ? 1 : -1);
         while (rotation_direction_votes_.size() >
                static_cast<std::size_t>(config_.physical_direction_window))
           rotation_direction_votes_.pop_front();
@@ -1561,29 +1322,35 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
         const double interval_s = timestamp_s - previous_cycle.time_s;
         if (interval_s >= config_.physical_speed_min_interval_s &&
             interval_s <= config_.physical_speed_max_interval_s) {
-          const double measured_magnitude = (kTwoPi / 3.0) / interval_s;
-          physical_speed_samples_.push_back(measured_magnitude);
-          while (physical_speed_samples_.size() >
-                 static_cast<std::size_t>(config_.physical_speed_window))
-            physical_speed_samples_.pop_front();
-          const double previous_magnitude = std::abs(physical_speed_);
-          const double magnitude = median(std::vector<double>(
-              physical_speed_samples_.begin(),
-              physical_speed_samples_.end()));
-          physical_speed_ = rotation_direction_valid_
-              ? std::copysign(magnitude, static_cast<double>(rotation_direction_sign_))
-              : magnitude;
-          if (physical_speed_valid_) {
-            const double measured_acceleration =
-                (magnitude - previous_magnitude) /
-                std::max(1e-3, interval_s / stride);
-            physical_acceleration_ =
-                (1.0 - config_.physical_speed_acceleration_gain) *
-                    physical_acceleration_ +
-                config_.physical_speed_acceleration_gain *
-                    measured_acceleration;
+          const double measured_magnitude =
+              angular_speed_from_handover_interval(stride, interval_s);
+          const double maximum_magnitude =
+              config_.max_abs_speed_deg_s * CV_PI / 180.0;
+          if (measured_magnitude <= maximum_magnitude) {
+            physical_speed_samples_.push_back(measured_magnitude);
+            while (physical_speed_samples_.size() >
+                   static_cast<std::size_t>(config_.physical_speed_window))
+              physical_speed_samples_.pop_front();
+            const double previous_magnitude = std::abs(physical_speed_);
+            const double magnitude = median(std::vector<double>(
+                physical_speed_samples_.begin(),
+                physical_speed_samples_.end()));
+            physical_speed_ = rotation_direction_valid_
+                ? std::copysign(magnitude,
+                                static_cast<double>(rotation_direction_sign_))
+                : magnitude;
+            if (physical_speed_valid_) {
+              const double measured_acceleration =
+                  (magnitude - previous_magnitude) /
+                  std::max(1e-3, interval_s / stride);
+              physical_acceleration_ =
+                  (1.0 - config_.physical_speed_acceleration_gain) *
+                      physical_acceleration_ +
+                  config_.physical_speed_acceleration_gain *
+                      measured_acceleration;
+            }
+            physical_speed_valid_ = true;
           }
-          physical_speed_valid_ = true;
         }
       }
       while (handover_events_.size() > stride +
@@ -1625,51 +1392,12 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
         detection_velocity_px_s_ *= 0.55;
         if (cv::norm(detection_velocity_px_s_) < 0.5) detection_velocity_px_s_ = {};
       }
-
-      ArmorObservation predicted = current;
-      cv::Point2d predicted_center = cv::Point2d(current.center) +
-          detection_velocity_px_s_ * prediction_lead_s;
-      cv::Point2d translation = predicted_center - cv::Point2d(current.center);
-      predicted.center = cv::Point2f(predicted_center);
-      for (auto& corner : predicted.corners) corner += cv::Point2f(translation);
-
-      const auto transition = select_handover_transition(current);
-      maybe_apply_handover_prediction(
-          current, transition, periodic_jump, &predicted);
-      if (detection_velocity_valid_ || output.image_future_handover) image_motion_future = predicted;
       previous_detection_ = current;
       previous_detection_time_s_ = timestamp_s;
       detection_history_valid_ = true;
     }
   }
-  if (!output.image_candidate_used && detection_history_valid_ &&
-      detection_velocity_valid_) {
-    const double history_age_s = timestamp_s - previous_detection_time_s_;
-    if (history_age_s >= 0.0 &&
-        history_age_s <= config_.image_prediction_history_timeout_s) {
-      ArmorObservation anchor = previous_detection_;
-      const cv::Point2d history_translation =
-          detection_velocity_px_s_ * history_age_s;
-      anchor.center += cv::Point2f(history_translation);
-      for (auto& corner : anchor.corners)
-        corner += cv::Point2f(history_translation);
-      ArmorObservation predicted = anchor;
-      const cv::Point2d future_translation =
-          detection_velocity_px_s_ * prediction_lead_s;
-      predicted.center += cv::Point2f(future_translation);
-      for (auto& corner : predicted.corners)
-        corner += cv::Point2f(future_translation);
-      const auto transition = select_handover_transition(anchor);
-      maybe_apply_handover_prediction(
-          anchor, transition, false, &predicted);
-      image_motion_future = predicted;
-      output.image_prediction_coasting = true;
-    }
-  }
-  output.detected_slot_index = output.candidate_available
-      ? (image_candidate_association_slot >= 0
-             ? image_candidate_association_slot : committed_slot_)
-      : -1;
+  output.detected_slot_index = accepted_measurement ? accepted_slot : -1;
   output.image_track_age_frames = frames_since_handover_;
   const auto projected = project_all(phase_);
   if (accepted_measurement && accepted_slot >= 0) {
@@ -1708,7 +1436,14 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
     prediction_acceleration = std::clamp(
         acceleration_, -acceleration_limit, acceleration_limit);
   }
-  output.future_phase_rad = phase_ + speed_ * output.prediction_lead_s +
+  const double authoritative_speed =
+      scene_moving_ && output.physical_speed_valid ? output.angular_speed_rad_s
+                                                   : (scene_moving_ ? speed_ : 0.0);
+  if (output.physical_speed_valid) {
+    speed_ = authoritative_speed;
+    phase_filter_state_[1] = speed_;
+  }
+  output.future_phase_rad = phase_ + authoritative_speed * output.prediction_lead_s +
       0.5 * prediction_acceleration * output.prediction_lead_s *
           output.prediction_lead_s;
   const auto future_projected = project_all(output.future_phase_rad);
@@ -1732,30 +1467,24 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
       destination.corners = projected[static_cast<std::size_t>(slot)].corners;
     }
   }
-  // The green recognition box is always the exact current-frame detector quad,
-  // regardless of whether the motion filter accepted the measurement.
-  if (output.candidate_available && output.detected_slot_index >= 0 &&
+  // The observed green box is the exact accepted light-band quadrilateral.
+  // Rejected candidates remain available only through output.candidate.
+  if (accepted_measurement && candidate_observation >= 0 &&
+      output.detected_slot_index >= 0 &&
       output.detected_slot_index < 3) {
     auto& destination = output.slots[static_cast<std::size_t>(output.detected_slot_index)];
+    const auto& accepted =
+        observations[static_cast<std::size_t>(candidate_observation)];
     destination.valid = true;
     destination.source = BoxSource::kObserved;
-    destination.center = output.candidate.center;
-    destination.corners = output.candidate.corners;
+    destination.center = accepted.center;
+    destination.corners = accepted.corners;
   }
 
-  int target_slot = display_candidate_slot_;
-  if (output.image_future_handover && target_slot >= 0 && future_handover_slot_step != 0)
-    target_slot = (target_slot + future_handover_slot_step + 3) % 3;
+  const int target_slot = committed_slot_;
   output.future_slot_index = target_slot;
   output.raw_future_target.id = target_slot + 1;
-  if (current_model_visible && image_motion_future.has_value() &&
-      target_slot >= 0 && target_slot < 3) {
-    output.raw_future_target.valid = true;
-    output.raw_future_target.source = BoxSource::kPredicted;
-    output.raw_future_target.center = image_motion_future->center;
-    output.raw_future_target.corners = image_motion_future->corners;
-    output.image_motion_prediction_used = true;
-  } else if (current_model_visible && target_slot >= 0 && target_slot < 3) {
+  if (current_model_visible && target_slot >= 0 && target_slot < 3) {
     const auto& target = future_projected[static_cast<std::size_t>(target_slot)];
     output.raw_future_target.valid = target.valid;
     output.raw_future_target.source =
@@ -1763,8 +1492,7 @@ SolverOutput RigidArmorSolver::update(const std::vector<ArmorObservation>& obser
     output.raw_future_target.center = target.center;
     output.raw_future_target.corners = target.corners;
   }
-  output.future_target = filter_future_target(
-      output.raw_future_target, target_slot, timestamp_s, &output);
+  output.future_target = output.raw_future_target;
   output.prediction_valid = output.future_target.valid;
   return output;
 }
