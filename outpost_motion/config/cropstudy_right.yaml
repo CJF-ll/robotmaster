@@ -1,0 +1,12 @@
+# Offline sensitivity experiment; does not change tracking configuration.
+video_config: config/video.yaml
+candidates_csv: outputs/neural_correspondence_20261011/neural_candidates.csv
+model_path: /home/rm/reference_study/sp_vision_25/assets/tiny_resnet.onnx
+output_csv: outputs/cropstudy_right_20261011.csv
+crop_axis_half_scale: 1.125
+confidence_threshold: 0.7
+diagnostic_shift_x_px: 1
+diagnostic_shift_y_px: 0
+labels: [one, two, three, four, five, sentry, outpost, base, not_armor]
+evidence_dir: outputs/cropstudy_right_20261011
+evidence_frames: [479, 480, 481]

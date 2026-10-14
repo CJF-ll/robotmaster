@@ -1,0 +1,15 @@
+video_config: config/video.yaml
+candidates_csv: outputs/neural_correspondence_20261011/neural_candidates.csv
+output_dir: outputs/classification_review_20261011
+crop_axis_half_scale: 1.125
+# Temporal partition of one previously inspected video, NOT an independent test.
+train_end_frame: 599
+validation_begin_frame: 660
+prediction_evidence:
+  - outputs/cropstudy_baseline_20261011/probabilities.csv
+  - outputs/cropstudy_scale100_20261011/probabilities.csv
+  - outputs/cropstudy_scale125_20261011/probabilities.csv
+  - outputs/cropstudy_left_20261011/probabilities.csv
+  - outputs/cropstudy_right_20261011/probabilities.csv
+  - outputs/cropstudy_up_20261011/probabilities.csv
+  - outputs/cropstudy_down_20261011/probabilities.csv

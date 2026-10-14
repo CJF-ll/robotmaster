@@ -1,0 +1,142 @@
+schema_version: 1
+target_slots:
+  # Only image_2d uses this local-ID/profile resolver; 3D always has three physical slots.
+  enabled: true
+  count: 3
+  local_observations: 3
+  profile_samples: 120
+  sequence_transitions: 6
+  height_gate_lengths: 0.65
+  length_ratio: 1.8
+  angle_degrees: 35
+  ambiguity_margin: 0.2
+  reset_gap_seconds: 5
+visibility:
+  # Image-only diagnostics; never modifies the calibrated_3d physical state.
+  min_axial_overlap: 0.6
+  side_distance_ratio: 0.25
+  angle_degrees: 25
+  length_ratio: 2
+detector:
+  # Shared measurement geometry in both modes. Disabled thresholds may be stored live.
+  endpoint_refinement:
+    enabled: false
+    search_fraction: 0.35
+    min_contrast: 8.0
+    max_spread_px: 1.5
+  backend: neural_supported
+  neural:
+    model: /home/rm/reference_study/sp_vision_25/assets/yolov8.xml
+    classifier_model: /home/rm/reference_study/sp_vision_25/assets/tiny_resnet.onnx
+    score_threshold: 0.7
+    nms_threshold: 0.3
+    classifier_threshold: 0.7
+    crop_axis_half_scale: 1.125
+    support_endpoint_fraction: 0.5
+    target_class_index: 6
+    # YOLO CPU inference threads; 0 = automatic. Restart required when changed.
+    inference_threads: 2
+  thin_vertical_enabled: true
+  thin_min_pixels: 8
+  reject_border_contours: true
+  border_margin_px: 0
+  brightness: 130
+  red_difference: 35
+  min_area: 4
+  min_length: 5
+  max_length: 80
+  min_aspect: 1.8
+  max_tilt_deg: 40
+  max_length_ratio: 2
+  max_angle_diff_deg: 25
+  min_separation: 0.6
+  max_separation: 4
+  max_vertical_offset: 0.8
+  end_margin_ratio: 0.08
+  side_margin_ratio: 0.15
+  end_margin_min_px: 1
+  side_margin_min_px: 0.75
+  pairing_ambiguity_margin: 0.05
+input:
+  kind: video
+  path: /home/rm/datasets/outpost/前哨站视频.mp4
+display:
+  enabled: true
+prediction:
+  horizon_seconds: 0.10
+tracking:
+  # This section is used only by image_2d; inactive values remain strictly validated.
+  common_endpoint_guard:
+    enabled: false
+    shrink_ratio: 0.75
+    width_tolerance: 0.10
+    max_gap_seconds: 0.10
+    min_hits: 5
+  one_sided_guard:
+    enabled: false
+    shrink_ratio: 0.7
+    other_side_tolerance: 0.1
+    min_hits: 5
+  # Advisory diagnostics only; never hides or accepts a prediction.
+  health:
+    window_seconds: 0.5
+    min_samples: 8
+    nis_warning: 5.991464547
+    failure_fraction: 0.4
+  low_resolution_noise_scale: 1.0
+  coast_seconds: 0.30
+  acceleration_noise: 25000
+  measurement_noise: 4
+  initial_velocity_variance: 10000
+  association_pixels: 30
+  innovation_gate: 13.82
+  max_shape_ratio: 2.5
+  max_position_std: 20
+  association_angle_degrees: 30
+  association_length_ratio: 2
+  ambiguity_margin: 1
+  association_miss_cost: 15
+  confirmation_hits: 3
+  prediction_hits: 5
+geometry:
+  # Raw image_2d does not consume K/D or physical dimensions.
+  # undistort uses K/D; calibrated_3d additionally requires measured lamp/axis geometry.
+  # armor_width_m / armor_height_m are retained metadata, not lightbar geometry.
+  undistort: false
+  calibration_width: 0
+  calibration_height: 0
+  allow_uniform_resize: false
+  mode: image_2d
+  # Unknown calibration stays null, never replaced with demo values.
+  camera_matrix: null
+  distortion: null
+  armor_width_m: null
+  armor_height_m: null
+  # Physical board dimensions above; centerline endpoint geometry below.
+  lightbar_length_m: null
+  lightbar_center_distance_m: null
+  rotation_radius_m: null
+  armor_pitch_deg: null
+  slot_height_offsets_m: null
+rigid_estimator:
+  # Only calibrated_3d uses these settings. Noise values are model assumptions.
+  pose_refinement_iterations: 20
+  pixel_noise_std_px: 0.5
+  min_geometry_information_ratio: 1.0e-8
+  max_center_std_m: 0.15
+  max_phase_std_rad: 0.35
+  translation_acceleration_std_m_s2: 1.0
+  angular_acceleration_std_rad_s2: 4.0
+  max_future_corner_std_px: 20.0
+  adaptive_window_enabled: true
+  motion_change_threshold_rad: 0.025
+  motion_change_threshold_m: 0.008
+  motion_change_confirmations: 3
+camera:
+  enabled: false
+control:
+  enabled: false
+ballistics:
+  enabled: false
+rule_speed_prior:
+  enabled: false

@@ -1,0 +1,9 @@
+# Diagnostic only. Not loaded by outpost_video.
+mode: full
+selection: direct
+history_samples: 7
+trend_sigma: 2
+max_scale: 1.8
+evidence_min_samples: 3
+evidence_window: 5
+evidence_min_gain_px: 0.1

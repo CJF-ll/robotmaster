@@ -1,0 +1,7 @@
+schema_version: 1
+reviewed_by_human: false
+audit_path: outputs/overlap_audit_20261011.csv
+# Inclusive zero-based issue-frame intervals; no overlap allowed.
+# Scenario: front / side / start_stop / reacquisition / occlusion.
+# Each entry: {first: frame_index, last: frame_index, scenario: scenario_name}
+segments: []

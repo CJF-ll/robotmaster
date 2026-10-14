@@ -1,0 +1,12 @@
+# Offline diagnostic, not enabled in the tracking backend.
+candidates_csv: outputs/neural_correspondence_20261011/neural_candidates.csv
+probabilities_csv: outputs/classifier_evidence_20261011/probabilities.csv
+correspondence_csv: outputs/neural_correspondence_20261011/correspondence.csv
+output_csv: outputs/temporal_classification_20261011.csv
+target_index: 6
+confirm_frames: 3
+max_hold_frames: 1
+accept_threshold: 0.7
+target_floor: 0.2
+negative_veto: 0.9
+endpoint_fraction: 0.5

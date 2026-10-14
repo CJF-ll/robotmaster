@@ -1,0 +1,9 @@
+video_config: config/video.yaml
+candidates_csv: outputs/neural_correspondence_20261011/neural_candidates.csv
+model_path: /home/rm/reference_study/sp_vision_25/assets/tiny_resnet.onnx
+output_csv: outputs/classifier_evidence_20261011.csv
+crop_axis_half_scale: 1.125
+confidence_threshold: 0.7
+labels: [one, two, three, four, five, sentry, outpost, base, not_armor]
+evidence_dir: outputs/classifier_evidence_20261011
+evidence_frames: [461, 478, 479, 480, 481, 482, 483, 484, 485, 486]

@@ -1,0 +1,15 @@
+schema_version: 1
+video_path: /home/rm/datasets/outpost/前哨站视频.mp4
+coordinate_space: raw
+width: 668
+height: 688
+# Set true only after human review. Empty template is never scored as truth.
+reviewed_by_human: false
+# Each complete frame must contain every fully visible paired armor.
+# Use only frames whose full set of visible pairs can be annotated reliably.
+# Hidden corners must not be guessed. A single-lamp-only frame may have objects: [].
+# Scenario: front / side / start_stop / reacquisition / occlusion / negative.
+# Objects: [{id: A1, points: [[TLx,TLy],[TRx,TRy],[BRx,BRy],[BLx,BLy]]}]
+# Points describe lamp CENTERLINE endpoints, not the outer display enclosure.
+# Frame indices start at 0. Exclude ambiguous frames and report exclusion count.
+frames: []

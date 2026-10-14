@@ -1,0 +1,8 @@
+# Standalone experimental detector comparison. Does not change video.yaml backend.
+video_config: config/video.yaml
+model_xml: /home/rm/reference_study/sp_vision_25/assets/yolov8.xml
+output_directory: outputs/neural_brightness_diagnostic_20261011
+diagnostic_brightness_levels: [90, 110, 130]
+endpoint_fraction: 0.5
+score_threshold: 0.7
+nms_threshold: 0.3
