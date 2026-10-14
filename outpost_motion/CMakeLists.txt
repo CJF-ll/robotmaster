@@ -12,6 +12,12 @@ target_compile_options(video_core PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(outpost_video src/main.cpp)
 target_link_libraries(outpost_video PRIVATE video_core)
 enable_testing()
+add_executable(center_forecast_tests tests/center_forecast_tests.cpp)
+target_link_libraries(center_forecast_tests PRIVATE video_core)
+add_test(NAME center_forecast_contracts COMMAND center_forecast_tests)
+add_executable(tentative_observation_tests tests/tentative_observation_tests.cpp)
+target_link_libraries(tentative_observation_tests PRIVATE video_core)
+add_test(NAME tentative_observation_contracts COMMAND tentative_observation_tests)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
   add_test(NAME timestamp_extraction_contracts COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/extract_timestamps.py --self-test)
@@ -187,6 +193,10 @@ add_test(NAME endpoint_support_contracts COMMAND endpoint_support_tests)
 if(OUTPOST_VIDEO_REGRESSION)
   add_test(NAME supplied_video_regression COMMAND video_regression ${CMAKE_CURRENT_SOURCE_DIR}/config/video.yaml)
   if(Python3_Interpreter_FOUND)
+    add_test(NAME center_forecast_video_contracts COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/center_forecast_regression.py
+      $<TARGET_FILE:prediction_evaluation> $<TARGET_FILE:outpost_video> ${CMAKE_CURRENT_SOURCE_DIR}/config/video.yaml)
+    set_tests_properties(center_forecast_video_contracts PROPERTIES TIMEOUT 60)
     add_test(NAME center_shape_scoring_contracts COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/audit_integration_tests.py center
       $<TARGET_FILE:prediction_evaluation> ${CMAKE_CURRENT_SOURCE_DIR}/config/video.yaml)

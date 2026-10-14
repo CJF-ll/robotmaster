@@ -56,6 +56,13 @@ display:
 prediction:
   horizon_seconds: 0.10
 tracking:
+  # Causal confirmed-observation fit; no prerecorded trajectory or angular speed.
+  center_forecast:
+    enabled: true
+    samples: 9
+    min_span_seconds: 0.20
+    max_gap_seconds: 0.10
+    blend: 0.5
   shape_guard:
     enabled: false
     max_drift_px: 3.0

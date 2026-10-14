@@ -58,7 +58,9 @@ std::vector<TrackOutput> Tracker::step(double time,const std::vector<Detection>&
       !std::isfinite(config_.common_endpoint_max_gap_seconds)||config_.common_endpoint_max_gap_seconds<=0||
       config_.common_endpoint_max_gap_seconds>config_.coast_seconds||config_.common_endpoint_min_hits<2||config_.common_endpoint_min_hits>100))
     throw std::runtime_error("invalid common endpoint guard configuration");
-  diagnostics_.clear();
+  diagnostics_.clear();tentative_.clear();
+  if(!center_forecast_config_valid(config_.center_forecast))
+    throw std::runtime_error("invalid center forecast configuration");
   // Validate the actual measurement before association AND birth. A finite
   // display quad alone does not guarantee a usable center/endpoint order.
   std::vector<const char*> invalid(detections.size(),nullptr);
@@ -186,6 +188,7 @@ std::vector<TrackOutput> Tracker::step(double time,const std::vector<Detection>&
   for(size_t i=0;i<tracks_.size();++i){auto& t=tracks_[i];
     t.clean_recovery_used=false;
     if(associated[i]<0){
+      t.center_history.clear();
       if(endpoint_suspect[i])t.prediction_ready=false;
       const bool clean=config_.clean_recovery_enabled&&detections.empty()&&
         !association.ambiguous_tracks[i]&&!t.identity_ambiguous&&
@@ -255,7 +258,12 @@ std::vector<TrackOutput> Tracker::step(double time,const std::vector<Detection>&
   // exists yet. Keep original detection indices for downstream diagnostics.
   for(size_t j=0;j<detections.size();++j)if(invalid[j])diagnostics_.push_back({0,int(j),invalid[j]});
   std::vector<TrackOutput> output;
-  for(size_t i=0;i<tracks_.size();++i){const auto& t=tracks_[i];if(!t.confirmed)continue;
+  for(size_t i=0;i<tracks_.size();++i){auto& t=tracks_[i];if(!t.confirmed){
+    // An accepted real pair is displayable before its motion is confirmed.
+    // Never expose a missing/rejected candidate or a tentative prediction.
+    if(associated[i]>=0)tentative_.push_back({t.id,associated[i]});
+    continue;
+  }
     TrackOutput o;o.id=t.id;o.measurement_used=associated[i]>=0;o.innovation=nis[i];
     o.health=t.health.summary(config_.health);
     o.detection_index=associated[i];
@@ -284,6 +292,21 @@ std::vector<TrackOutput> Tracker::step(double time,const std::vector<Detection>&
     for(int k=0;k<4;++k)o.lamp_support_points[k]=o.measurement_used?
       detections[associated[i]].measurement_points[k]:o.current_center+t.measurement_shape[k];
     o.future=corners(t,horizon);
+    if(config_.center_forecast.enabled&&o.measurement_used){
+      t.center_history.add(time,o.current_center,o.measurement_variances,config_.center_forecast);
+      if(t.prediction_ready&&!t.identity_ambiguous){
+        const auto candidate=t.center_history.predict(horizon,config_.center_forecast);
+        if(candidate){
+          const auto blended=blend_center_forecasts(
+            {o.future_center,o.future_position_variance},*candidate,config_.center_forecast.blend);
+          const cv::Point2f center(float(blended.center.x),float(blended.center.y));
+          const auto translation=center-o.future_center;
+          o.future_center=center;o.future_position_variance=blended.variance;
+          for(auto& p:o.future)p+=translation;
+          o.center_forecast_blended=true;
+        }
+      }
+    }
     o.forecast=assess_forecast(t.prediction_ready,
                               std::isfinite(o.future_center.x)&&std::isfinite(o.future_center.y),o.future_position_variance,
                               o.age_seconds,horizon,config_.coast_seconds,config_.max_position_std,

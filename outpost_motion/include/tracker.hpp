@@ -2,10 +2,12 @@
 #include "detector.hpp"
 #include "innovation_health.hpp"
 #include "forecast_assessment.hpp"
+#include "center_forecast.hpp"
 #include <cstdint>
 #include <deque>
 namespace outpost {
 struct TrackerConfig {
+  CenterForecastConfig center_forecast;
   bool shape_guard_enabled=false;
   double max_shape_drift_px=3.;
   int shape_history_samples=4;
@@ -44,6 +46,7 @@ struct TrackOutput {
   TrackState state = TrackState::Tentative;
   bool measurement_used = false, future_valid = false;
   bool future_center_valid=false, future_shape_reliable=false;
+  bool center_forecast_blended=false;
   double shape_drift_px=INFINITY;
   std::array<cv::Point2f,4> current{}, future{};
   // Accepted centerline endpoints, or last measured endpoints translated by
@@ -73,9 +76,11 @@ class Tracker {
     bool innovation_available=false;
   };
   const std::vector<AssociationDiagnostic>& association_diagnostics()const{return diagnostics_;}
+  struct TentativeObservation {std::uint64_t id;int detection_index;};
+  const std::vector<TentativeObservation>& tentative_observations()const{return tentative_;}
   explicit Tracker(TrackerConfig config):config_(config) {}
   // Runtime model changes invalidate tracks but never recycle identity IDs.
-  void reconfigure(TrackerConfig config) { config_=config;tracks_.clear();diagnostics_.clear(); }
+  void reconfigure(TrackerConfig config) { config_=config;tracks_.clear();diagnostics_.clear();tentative_.clear(); }
   std::vector<TrackOutput> step(double time, const std::vector<Detection>& detections,
                                 double horizon);
  private:
@@ -85,6 +90,7 @@ class Tracker {
     void update(double value,double r);
   };
   struct Track {
+    CenterForecastHistory center_history;
     InnovationHealth health;
     std::uint64_t id;
     // Motion is estimated independently of perspective corner deformation.
@@ -109,6 +115,7 @@ class Tracker {
   TrackerConfig config_;
   std::vector<Track> tracks_;
   std::vector<AssociationDiagnostic> diagnostics_;
+  std::vector<TentativeObservation> tentative_;
   std::uint64_t next_id_=1;
   double last_time_=-1;
 };

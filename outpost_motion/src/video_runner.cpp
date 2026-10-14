@@ -101,7 +101,10 @@ int outpost::run_video(const std::string& config_path,bool headless,bool save_vi
     endpoints<<"frame,index,left_evidence,right_evidence,both_refined,min_contrast,max_spread_px\n";
     std::ofstream shape_log(artifact("shape_reliability.csv"));shape_log.precision(17);
     if(!shape_log)throw std::runtime_error("cannot create shape diagnostics");
-    shape_log<<"frame,id,center_valid,shape_reliable,shape_drift_px,guard_enabled,future_valid\n";
+    shape_log<<"frame,id,center_valid,shape_reliable,shape_drift_px,guard_enabled,future_valid,center_forecast_blended\n";
+    std::ofstream tentative_log(artifact("tentative_observations.csv"));
+    if(!tentative_log)throw std::runtime_error("cannot create tentative observation log");
+    tentative_log<<"frame,id,detection_index,current_drawn,future_drawn\n";
     candidates<<"frame,time,index,left_lamp,right_lamp,cx,cy,m0x,m0y,m1x,m1y,m2x,m2y,m3x,m3y,d0x,d0y,d1x,d1y,d2x,d2y,d3x,d3y,low_resolution\n";
     std::ofstream pair_log(artifact("pairing.csv"));
     if(!pair_log)throw std::runtime_error("cannot create pairing diagnostics");
@@ -226,9 +229,16 @@ int outpost::run_video(const std::string& config_path,bool headless,bool save_vi
         cv::polylines(frame.image,points,true,color,1,cv::LINE_AA);
       };
       size_t drawn_current=0,drawn_future=0;
+      for(const auto& observation:estimate.tentative_observations){
+        const auto& measured=detections.at(size_t(observation.detection_index));
+        draw(measured.corners,{0,255,0});++drawn_current;
+        cv::putText(frame.image,"T"+std::to_string(observation.id)+" tentative obs",
+          measured.corners[0]-cv::Point2f(0,4),cv::FONT_HERSHEY_SIMPLEX,.35,{0,255,0},1);
+        tentative_log<<frame.index<<','<<observation.id<<','<<observation.detection_index<<",1,0\n";
+      }
       for(size_t i=0;i<tracked.size();++i) {const auto& t=tracked[i];
         shape_log<<frame.index<<','<<t.id<<','<<t.future_center_valid<<','<<t.future_shape_reliable<<','
-          <<t.shape_drift_px<<','<<config.tracker.shape_guard_enabled<<','<<t.future_valid<<'\n';
+          <<t.shape_drift_px<<','<<config.tracker.shape_guard_enabled<<','<<t.future_valid<<','<<t.center_forecast_blended<<'\n';
         const auto& h=t.health;
         health_log<<frame.index<<','<<frame.time_seconds<<','<<t.id<<','<<t.measurement_used<<','
                   <<h.samples<<','<<h.ready<<','<<h.warning<<','<<h.mean_nis<<','<<h.failure_fraction<<','
@@ -302,7 +312,7 @@ int outpost::run_video(const std::string& config_path,bool headless,bool save_vi
       const auto encode_begin=Clock::now();
       if(save_video)writer.write(frame.image);
       const auto encode_end=Clock::now();
-      if(frame.index==180 || frame.index==360 || frame.index==480 || frame.index==720)
+      if(frame.index==0 || frame.index==180 || frame.index==360 || frame.index==480 || frame.index==720)
         if(!cv::imwrite(artifact("frame_"+std::to_string(frame.index)+".png"),frame.image))
           throw std::runtime_error("cannot save diagnostic image");
       const auto snapshot_end=Clock::now();
@@ -326,7 +336,7 @@ int outpost::run_video(const std::string& config_path,bool headless,bool save_vi
       if(interrupted)break;
     }
     for(auto* stream:{&metrics,&quality,&tracks,&motion,&slot_log,&candidates,&frames,&pair_log,
-                      &coordinates,&association_log,&health_log,&provenance,&backend_audit,&endpoints,&timing,&detector_timing,&reliability,&timestamps,&shape_log}){
+                      &coordinates,&association_log,&health_log,&provenance,&backend_audit,&endpoints,&timing,&detector_timing,&reliability,&timestamps,&shape_log,&tentative_log}){
       stream->flush();if(!*stream)throw std::runtime_error("incomplete output log");
     }
     if(rigid_output)rigid_output->finish();

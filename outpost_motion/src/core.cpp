@@ -254,6 +254,15 @@ Config Config::parse(const std::string& text) {
   c.coast_seconds = root["tracking"]["coast_seconds"].as<double>();
   auto& t=c.tracker;t.coast_seconds=c.coast_seconds;
   const auto tr=root["tracking"];
+  const auto center=tr["center_forecast"];
+  if(center){auto& f=t.center_forecast;
+    f.enabled=center["enabled"].as<bool>(false);
+    f.samples=center["samples"].as<int>(9);
+    f.min_span_seconds=center["min_span_seconds"].as<double>(.20);
+    f.max_gap_seconds=center["max_gap_seconds"].as<double>(.10);
+    f.blend=center["blend"].as<double>(.5);
+  }
+  if(!center_forecast_config_valid(t.center_forecast))throw std::runtime_error("invalid center forecast settings");
   const auto shape=tr["shape_guard"];
   if(shape){t.shape_guard_enabled=shape["enabled"].as<bool>(false);
     t.max_shape_drift_px=shape["max_drift_px"].as<double>(3.);
@@ -376,6 +385,9 @@ Config Config::parse(const std::string& text) {
         t.association_pixels,t.innovation_gate,t.max_shape_ratio,t.coast_seconds,t.max_position_std,t.association_angle_degrees,
         t.association_length_ratio,t.ambiguity_margin,t.association_miss_cost})signature<<value<<',';
     signature<<t.confirmation_hits<<','<<t.prediction_hits<<';';
+    signature<<t.center_forecast.enabled<<';';
+    if(t.center_forecast.enabled)signature<<t.center_forecast.samples<<','<<t.center_forecast.min_span_seconds<<','
+      <<t.center_forecast.max_gap_seconds<<','<<t.center_forecast.blend<<';';
     signature<<t.shape_guard_enabled<<';';if(t.shape_guard_enabled)signature<<t.max_shape_drift_px<<','<<t.shape_history_samples<<';';
     signature<<t.measurement_quality_enabled<<';';if(t.measurement_quality_enabled)signature<<t.measurement_quality_max_scale<<';';
     signature<<t.clean_recovery_enabled<<';';if(t.clean_recovery_enabled)signature<<t.clean_recovery_max_gap_seconds<<','<<t.clean_recovery_max_nis<<','<<t.clean_recovery_hits<<';';

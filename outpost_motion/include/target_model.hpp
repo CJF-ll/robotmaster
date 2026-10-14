@@ -7,6 +7,7 @@
 namespace outpost {
 struct TargetEstimate {
   std::vector<TrackOutput> tracks;
+  std::vector<Tracker::TentativeObservation> tentative_observations;
   std::vector<SlotAssignment> slots;
   std::vector<Tracker::AssociationDiagnostic> associations;
   int epoch=0;
@@ -26,6 +27,7 @@ class ImageTargetModel final:public TargetModel {
   ImageTargetModel(TrackerConfig t,SlotConfig s):tracker_(t),slots_(s){}
   TargetEstimate update(double time,const std::vector<Detection>& observations,double horizon)override{
     TargetEstimate e;e.tracks=tracker_.step(time,observations,horizon);
+    e.tentative_observations=tracker_.tentative_observations();
     e.slots=slots_.update(time,e.tracks,observations);e.associations=tracker_.association_diagnostics();
     e.epoch=slots_.epoch();e.sequence_consistent=slots_.consistent();e.recurrence_seconds=slots_.recurrence_seconds();
     return e;

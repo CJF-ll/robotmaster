@@ -7,6 +7,24 @@ int main(int argc,char**argv){
   if(argc!=2)return 2;
   outpost::ConfigRuntime runtime(argv[1]);std::string message;
   auto root=YAML::LoadFile(argv[1]);
+  {outpost::ConfigRuntime fit(argv[1]);auto cfg=YAML::LoadFile(argv[1]);
+    cfg["tracking"]["center_forecast"]["enabled"]=false;
+    fit.apply_text(YAML::Dump(cfg),message);
+    cfg["tracking"]["center_forecast"]["enabled"]=true;
+    require(fit.apply_text(YAML::Dump(cfg),message)==outpost::ReloadResult::ResetRequired,"center forecast enable did not reset");
+    cfg["tracking"]["center_forecast"]["samples"]=11;
+    require(fit.apply_text(YAML::Dump(cfg),message)==outpost::ReloadResult::ResetRequired,"center forecast history did not reset");
+    cfg["tracking"]["center_forecast"]["blend"]=2.;
+    require(fit.apply_text(YAML::Dump(cfg),message)==outpost::ReloadResult::Rejected,"invalid forecast blend accepted");
+    require(fit.current().tracker.center_forecast.samples==11,"failed reload damaged forecast state");
+    cfg["tracking"]["center_forecast"]["blend"]=.5;
+    cfg["tracking"]["center_forecast"]["enabled"]=false;
+    require(fit.apply_text(YAML::Dump(cfg),message)==outpost::ReloadResult::ResetRequired,"center forecast disable did not reset");
+    cfg["tracking"]["center_forecast"]["samples"]=13;
+    require(fit.apply_text(YAML::Dump(cfg),message)==outpost::ReloadResult::LiveUpdated,"inactive forecast history reset state");
+    cfg["tracking"]["center_forecast"]["samples"]=1;
+    require(fit.apply_text(YAML::Dump(cfg),message)==outpost::ReloadResult::Rejected,"invalid inactive forecast config accepted");
+  }
   {outpost::ConfigRuntime strict(argv[1]);const auto original=strict.current().source_text;
     auto reject=[&](const std::string& text,const std::string& key){
       require(strict.apply_text(text,message)==outpost::ReloadResult::Rejected,"unknown/duplicate config committed");
