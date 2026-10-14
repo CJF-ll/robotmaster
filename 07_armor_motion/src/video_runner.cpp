@@ -13,6 +13,8 @@
 #include <iostream>
 #include <chrono>
 #include <cmath>
+#include <sstream>
+#include <iomanip>
 
 int outpost::run_video(const std::string& config_path,bool headless,bool save_video,const std::string& output_dir) {
   try {
@@ -105,6 +107,12 @@ int outpost::run_video(const std::string& config_path,bool headless,bool save_vi
     std::ofstream tentative_log(artifact("tentative_observations.csv"));
     if(!tentative_log)throw std::runtime_error("cannot create tentative observation log");
     tentative_log<<"frame,id,detection_index,current_drawn,future_drawn\n";
+    std::ofstream coaxial_log(artifact("coaxial_phase.csv"));coaxial_log.precision(17);
+    if(!coaxial_log)throw std::runtime_error("cannot create coaxial phase log");
+    std::ofstream fitted_log(artifact("three_plate_model.csv"));fitted_log.precision(17);
+    if(!fitted_log)throw std::runtime_error("cannot create three plate model log");
+    fitted_log<<"frame,time,generation,slot,valid,observed,phase_rad,omega_rad_s,period_seconds,center_x,center_y,cos_x,cos_y,sin_x,sin_y,current_x,current_y,future_x,future_y\n";
+    coaxial_log<<"frame,time,enabled,initialized,valid,measurement_used,phase_rad,omega_rad_s,period_seconds,fit_rms,age_seconds,reason,generation\n";
     candidates<<"frame,time,index,left_lamp,right_lamp,cx,cy,m0x,m0y,m1x,m1y,m2x,m2y,m3x,m3y,d0x,d0y,d1x,d1y,d2x,d2y,d3x,d3y,low_resolution\n";
     std::ofstream pair_log(artifact("pairing.csv"));
     if(!pair_log)throw std::runtime_error("cannot create pairing diagnostics");
@@ -229,6 +237,35 @@ int outpost::run_video(const std::string& config_path,bool headless,bool save_vi
         cv::polylines(frame.image,points,true,color,1,cv::LINE_AA);
       };
       size_t drawn_current=0,drawn_future=0;
+      const auto& phase_state=estimate.coaxial;
+      if(config.tracker.coaxial.enabled)for(int s=0;s<3;++s){
+        const bool observed=phase_state.measurement_used&&std::find(phase_state.observation_slots.begin(),
+          phase_state.observation_slots.end(),s)!=phase_state.observation_slots.end();
+        fitted_log<<frame.index<<','<<frame.time_seconds<<','<<phase_state.generation<<','<<s+1<<','
+          <<phase_state.valid<<','<<observed;
+        if(phase_state.valid){
+          const auto c=phase_state.orbit_centers[s],p=phase_state.current[s],f=phase_state.future[s];
+          fitted_log<<','<<phase_state.phase+s*2*CV_PI/3<<','<<phase_state.omega<<','<<phase_state.period_seconds
+            <<','<<c.x<<','<<c.y<<','<<phase_state.cosine.x<<','<<phase_state.cosine.y
+            <<','<<phase_state.sine.x<<','<<phase_state.sine.y<<','<<p.x<<','<<p.y<<','<<f.x<<','<<f.y;
+          // Dotted fitted center loci, not detector contours or metric 3D.
+          const cv::Scalar color(255,210,80);
+          for(int k=0;k<72;k+=2){
+            const auto a=phase_state.model_point(s,k*2*CV_PI/72);
+            const auto b=phase_state.model_point(s,(k+1)*2*CV_PI/72);
+            cv::line(frame.image,a,b,color,1,cv::LINE_AA);
+          }
+          cv::circle(frame.image,p,4,color,1,cv::LINE_AA);
+          cv::drawMarker(frame.image,f,color,cv::MARKER_CROSS,7,1,cv::LINE_AA);
+          cv::putText(frame.image,"M"+std::to_string(s+1),p+cv::Point2d(6,-6),
+            cv::FONT_HERSHEY_SIMPLEX,.35,color,1,cv::LINE_AA);
+        }else fitted_log<<",nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan";
+        fitted_log<<'\n';
+      }
+      coaxial_log<<frame.index<<','<<frame.time_seconds<<','<<config.tracker.coaxial.enabled<<','
+        <<phase_state.initialized<<','<<phase_state.valid<<','<<phase_state.measurement_used<<','
+        <<phase_state.phase<<','<<phase_state.omega<<','<<phase_state.period_seconds<<','
+        <<phase_state.fit_rms<<','<<phase_state.age_seconds<<','<<phase_state.reason<<','<<phase_state.generation<<'\n';
       for(const auto& observation:estimate.tentative_observations){
         const auto& measured=detections.at(size_t(observation.detection_index));
         draw(measured.corners,{0,255,0});++drawn_current;
@@ -288,8 +325,20 @@ int outpost::run_video(const std::string& config_path,bool headless,bool save_vi
                   cv::FONT_HERSHEY_SIMPLEX,.42,{255,255,255},1);
       cv::putText(frame.image,"lead="+std::to_string(config.prediction_seconds)+"s; S=online slot hypothesis",
                   {10,45},cv::FONT_HERSHEY_SIMPLEX,.4,{255,255,255},1);
-      cv::putText(frame.image,estimate.sequence_consistent?"slot sequence consistent; forecast=2D translation":
-                                                "slot order unconfirmed; forecast=2D translation",
+      if(config.tracker.coaxial.enabled){
+        std::ostringstream state;state<<std::fixed<<std::setprecision(2);
+        if(!phase_state.initialized)state<<"coaxial phase: initializing (no linear fallback)";
+        else if(!phase_state.valid)state<<"coaxial phase: unavailable";
+        else {state<<"phase="<<std::remainder(phase_state.phase,2*CV_PI)*180/CV_PI
+          <<" deg; omega="<<phase_state.omega<<" rad/s; T=";
+          if(phase_state.period_seconds>0)state<<phase_state.period_seconds<<" s";else state<<"-- (stopped)";}
+        cv::putText(frame.image,state.str(),{10,65},cv::FONT_HERSHEY_SIMPLEX,.4,{255,255,255},1);
+        cv::putText(frame.image,"affine coaxial model; phase sign uses slot convention",{10,85},
+          cv::FONT_HERSHEY_SIMPLEX,.4,{255,255,255},1);
+        cv::putText(frame.image,"CYAN M1-3: fitted centers; o=now +=future; dots=orbit",{10,105},
+          cv::FONT_HERSHEY_SIMPLEX,.38,{255,210,80},1);
+      }else cv::putText(frame.image,estimate.sequence_consistent?"slot sequence consistent; forecast=2D translation":
+                                                 "slot order unconfirmed; forecast=2D translation",
                   {10,65},cv::FONT_HERSHEY_SIMPLEX,.4,{255,255,255},1);
       }
       if(save_video&&!writer.isOpened()) {
@@ -336,7 +385,7 @@ int outpost::run_video(const std::string& config_path,bool headless,bool save_vi
       if(interrupted)break;
     }
     for(auto* stream:{&metrics,&quality,&tracks,&motion,&slot_log,&candidates,&frames,&pair_log,
-                      &coordinates,&association_log,&health_log,&provenance,&backend_audit,&endpoints,&timing,&detector_timing,&reliability,&timestamps,&shape_log,&tentative_log}){
+                      &coordinates,&association_log,&health_log,&provenance,&backend_audit,&endpoints,&timing,&detector_timing,&reliability,&timestamps,&shape_log,&tentative_log,&coaxial_log,&fitted_log}){
       stream->flush();if(!*stream)throw std::runtime_error("incomplete output log");
     }
     if(rigid_output)rigid_output->finish();

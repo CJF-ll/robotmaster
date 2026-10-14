@@ -3,10 +3,12 @@
 #include "innovation_health.hpp"
 #include "forecast_assessment.hpp"
 #include "center_forecast.hpp"
+#include "coaxial_phase.hpp"
 #include <cstdint>
 #include <deque>
 namespace outpost {
 struct TrackerConfig {
+  CoaxialConfig coaxial;
   CenterForecastConfig center_forecast;
   bool shape_guard_enabled=false;
   double max_shape_drift_px=3.;

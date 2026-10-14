@@ -254,6 +254,24 @@ Config Config::parse(const std::string& text) {
   c.coast_seconds = root["tracking"]["coast_seconds"].as<double>();
   auto& t=c.tracker;t.coast_seconds=c.coast_seconds;
   const auto tr=root["tracking"];
+  const auto coax=tr["coaxial_phase"];
+  if(coax){auto& f=t.coaxial;
+    f.enabled=coax["enabled"].as<bool>(false);
+    f.window_seconds=coax["window_seconds"].as<double>(3.);
+    f.fit_interval_seconds=coax["fit_interval_seconds"].as<double>(.5);
+    f.min_omega=coax["min_omega"].as<double>(.3);f.max_omega=coax["max_omega"].as<double>(6.);
+    f.omega_step=coax["omega_step"].as<double>(.05);f.max_fit_rms=coax["max_fit_rms"].as<double>(6.);
+    f.ambiguity_ratio=coax["ambiguity_ratio"].as<double>(1.3);
+    f.innovation_pixels=coax["innovation_pixels"].as<double>(15.);
+    f.max_phase_correction=coax["max_phase_correction"].as<double>(.4);
+    f.coast_seconds=coax["coast_seconds"].as<double>(.3);f.stop_omega=coax["stop_omega"].as<double>(.07);
+    f.offset_gain=coax["offset_gain"].as<double>(.25);
+    f.association_pixels=coax["association_pixels"].as<double>(30.);
+    f.association_margin=coax["association_margin"].as<double>(3.);
+    f.min_samples=coax["min_samples"].as<int>(40);f.min_slot_samples=coax["min_slot_samples"].as<int>(6);
+    f.phase_samples=coax["phase_samples"].as<int>(9);f.max_samples=coax["max_samples"].as<int>(120);
+  }
+  if(!coaxial_config_valid(t.coaxial))throw std::runtime_error("invalid coaxial phase settings");
   const auto center=tr["center_forecast"];
   if(center){auto& f=t.center_forecast;
     f.enabled=center["enabled"].as<bool>(false);
@@ -385,6 +403,15 @@ Config Config::parse(const std::string& text) {
         t.association_pixels,t.innovation_gate,t.max_shape_ratio,t.coast_seconds,t.max_position_std,t.association_angle_degrees,
         t.association_length_ratio,t.ambiguity_margin,t.association_miss_cost})signature<<value<<',';
     signature<<t.confirmation_hits<<','<<t.prediction_hits<<';';
+    signature<<t.coaxial.enabled<<';';if(t.coaxial.enabled){
+      if(!c.slots.enabled||c.slots.count!=3)throw std::runtime_error("coaxial phase requires three enabled slots");
+      const auto& f=t.coaxial;
+      signature<<f.window_seconds<<','<<f.fit_interval_seconds<<','<<f.min_omega<<','<<f.max_omega<<','
+        <<f.omega_step<<','<<f.max_fit_rms<<','<<f.ambiguity_ratio<<','<<f.innovation_pixels<<','
+        <<f.max_phase_correction<<','<<f.coast_seconds<<','<<f.stop_omega<<','<<f.min_samples<<','
+        <<f.min_slot_samples<<','<<f.phase_samples<<','<<f.max_samples<<','<<f.offset_gain<<','
+        <<f.association_pixels<<','<<f.association_margin<<';';
+    }
     signature<<t.center_forecast.enabled<<';';
     if(t.center_forecast.enabled)signature<<t.center_forecast.samples<<','<<t.center_forecast.min_span_seconds<<','
       <<t.center_forecast.max_gap_seconds<<','<<t.center_forecast.blend<<';';

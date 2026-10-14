@@ -32,7 +32,7 @@
 
 X、Y 两轴分别使用位置—速度卡尔曼状态，根据帧间时间进行预测，再用接受观测更新。测量噪声、加速度噪声、初始速度方差和关联门限均从 YAML 读取。
 
-默认视频配置还启用多帧中心预测融合：
+`config/video.yaml` 保留二维线性预测配置，启用多帧中心预测融合：
 
 1. 收集最近 9 次连续、已确认的实测中心。
 2. 使用实际时间间隔做线性拟合，得到二维速度。
@@ -49,11 +49,33 @@ X、Y 两轴分别使用位置—速度卡尔曼状态，根据帧间时间进�
 
 三槽位模块根据局部轨迹的观测特征和访问顺序维护身份假设。槽位编号与局部 ID 分开记录，不将尚未确认的槽位关系表示为永久实体身份。
 
+### 三板同轴旋转拟合
+
+本次三板拟合使用 `config/coaxial_video.yaml`，关闭上述线性融合，以连续观测建立仿射／弱透视的二维同轴旋转模型。三个板子的中心位置表示为：
+
+```text
+p_i(t) = c_i + a*cos(theta(t) + 2*pi*i/3)
+             + b*sin(theta(t) + 2*pi*i/3), i = 0, 1, 2
+```
+
+三个板子共用投影向量 a、b 和公共相位 theta，分别拟合轨迹中心 c_i，以容纳高低错落。该表达式描述图像中的中心椭圆轨迹，不恢复真实半径、距离或板面四角。
+
+初始化只使用已经获得独立槽位标签的历史观测。在最近 3 秒窗口内搜索正、负角速度，并对每个候选解拟合投影参数。至少积累 40 个观测、每个槽位至少 6 个观测、时间跨度达到 2.25 秒后，再检查拟合残差和不同周期解的歧义。数据不足、静止信息不足或歧义未消除时不生成模型预测。
+
+固定相机下，初始化完成后保持投影基准稳定。每帧先按时间间隔推进相位，再通过接受观测的投影残差修正相位，用最近多帧相位与时间的线性回归更新角速度。各槽位另维护低通位置偏移，关联、当前投影和未来投影使用同一套修正几何。
+
+尚无槽位标签的灯带配对可与模型位置进行一对一关联；只有唯一且通过门限的匹配参与相位更新。这些模型关联标签不回灌初始化样本，也不直接将暂定局部轨迹升级为已确认身份。
+
+短时预测使用 `theta_future = theta + omega * prediction_seconds`，再计算三个板子的未来中心。角速度来自历史观测，不使用固定转速、未来帧或整段视频预学习轨迹。相位零点以拟合轨迹的水平极值为基准，角速度符号依赖槽位约定，不等同于已标定的物理顺逆时针方向。低于停止门限时周期记为 0，表示不输出有限旋转周期。
+
+漏检时在配置期限内推进模型；观测年龄与预测提前量之和超过期限后停止输出有效模型。长期失效或槽位代次变化后重新初始化。三板中心模型可以显示未观测板的位置，但完整未来四边形仍需通过局部轨迹及观测有效性检查，并仅平移真实观测形状，不独立外推角点。
+
 ## 四、画面叠加
 
 - 绿色：当前接受的双灯带观测。
 - 橙色：具有可见灯带支持的短时跟踪框。
 - 红色：通过历史、身份、时间范围及不确定度检查的未来框。
+- 青色：同轴模型的三个中心轨迹，虚线为拟合椭圆，圆点为当前模型位置，十字为提前预测位置，M1—M3 为当前模型槽位。
 
 画面同时显示编号、跟踪状态和预测提前量。`display.enabled: true` 且未传入 `--headless` 时调用 `cv::imshow`，按 ESC 结束运行。
 
@@ -74,11 +96,12 @@ X、Y 两轴分别使用位置—速度卡尔曼状态，根据帧间时间进�
 
 ## 六、参数配置
 
-`config/video.yaml` 为本次视频的默认配置，主要分为：
+`config/coaxial_video.yaml` 用于三板同轴拟合，`config/video.yaml` 保留线性二维模式，配置主要分为：
 
 - `input`：视频路径、时间戳和读取队列。
 - `detector`：亮度、颜色、灯带几何、配对及显示外扩参数。
 - `tracking`：滤波噪声、关联、确认、漏检期限及中心预测融合。
+- `tracking.coaxial_phase`：同轴拟合窗口、角速度搜索范围、样本门限、相位修正、关联、停止判断与预测期限。
 - `prediction`：预测提前量。
 - `target_slots`、`visibility`：二维槽位关系及绘制所需的灯带支持。
 - `geometry`、`rigid_estimator`：相机标定、实体尺寸和三维估计参数。
@@ -88,7 +111,7 @@ X、Y 两轴分别使用位置—速度卡尔曼状态，根据帧间时间进�
 
 ## 七、代码结构与运行
 
-`src/core.cpp` 负责配置和输入，`src/detector.cpp` 负责灯带检测，`src/tracker.cpp` 负责二维关联与状态估计，`include/center_forecast.hpp` 实现中心拟合与预测融合，`src/target_slots.cpp` 维护槽位假设，`src/rigid_estimator.cpp` 实现三维估计，`src/video_runner.cpp` 串联流程并绘制结果。
+`src/core.cpp` 负责配置和输入，`src/detector.cpp` 负责灯带检测，`src/tracker.cpp` 负责二维关联与状态估计，`include/center_forecast.hpp` 实现线性中心拟合与预测融合，`src/coaxial_phase.cpp` 实现三板共同投影、相位及角速度估计，`include/target_model.hpp` 连接局部跟踪与公共模型，`src/target_slots.cpp` 维护槽位假设，`src/rigid_estimator.cpp` 实现三维估计，`src/video_runner.cpp` 串联流程并绘制结果。
 
 依赖 C++17、CMake、OpenCV 4 和 yaml-cpp；网络后端另需 OpenVINO。虚拟机中运行：
 
@@ -96,15 +119,17 @@ X、Y 两轴分别使用位置—速度卡尔曼状态，根据帧间时间进�
 cd /home/rm/robotmaster/07_armor_motion
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
-./build/outpost_video config/video.yaml --no-video
+./build/outpost_video config/coaxial_video.yaml --no-video
 ```
 
 无图形显示时使用：
 
 ```bash
-./build/outpost_video config/video.yaml --headless --no-video
+./build/outpost_video config/coaxial_video.yaml --headless --no-video
 ```
 
 输入路径由 YAML 指定。程序为每次运行创建独立结果目录，`--output-dir 新目录` 可指定位置，不覆盖已有结果。`--no-video` 关闭视频保存；不传该参数时生成 `tracking-preview.mp4`。
 
 运行日志分别记录检测候选、关联原因、跟踪状态、槽位、预测不确定度及绘制状态。`tentative_observations.csv` 保存暂定观测，`shape_reliability.csv` 中的 `center_forecast_blended` 标记是否使用中心预测融合。三维状态使用独立日志，避免与二维量混淆。程序同时保存生效配置及变更事件，输出检查完成后将运行状态标记为 `completed`。
+
+`coaxial_phase.csv` 记录公共相位、角速度、周期、拟合误差、模型代次与有效状态。`three_plate_model.csv` 按帧记录三个槽位的轨迹中心、共享投影向量、当前位置和未来位置；无效时输出有效性标记及空值 NaN，不把零坐标当作拟合结果。
