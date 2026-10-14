@@ -1,6 +1,0 @@
-/build/
-/deps/
-/build-openvino/
-/build-openvino-2024/
-/outputs/
-*.mp4

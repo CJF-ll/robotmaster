@@ -47,8 +47,8 @@ detector:
   side_margin_min_px: 0.75
   pairing_ambiguity_margin: 0.05
 input:
-  timestamp_file: "" # Optional CSV: frame,time_seconds; exact decoded-frame order.
-  prefetch_frames: 0 # 0 synchronous; 1..8 bounded decoder queue; no drops.
+  timestamp_file: "/home/rm/robotmaster/07_armor_motion/outputs/input_pts_20261013.csv" # Optional CSV: frame,time_seconds; exact decoded-frame order.
+  prefetch_frames: 2 # 0 synchronous; 1..8 bounded decoder queue; no drops.
   kind: video
   path: /home/rm/datasets/outpost/前哨站视频.mp4
 display:
@@ -56,13 +56,6 @@ display:
 prediction:
   horizon_seconds: 0.10
 tracking:
-  # Causal confirmed-observation fit; no prerecorded trajectory or angular speed.
-  center_forecast:
-    enabled: true
-    samples: 9
-    min_span_seconds: 0.20
-    max_gap_seconds: 0.10
-    blend: 0.5
   shape_guard:
     enabled: false
     max_drift_px: 3.0

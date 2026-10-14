@@ -1,6 +1,6 @@
 # 统一主流程与几何估计集成验证
 
-运行位置：Ubuntu aarch64 虚拟机 `/home/rm/robotmaster/outpost_motion`。本轮没有训练、GitHub 推送或效果视频导出。参考版本为 TongjiSuperPower/sp_vision_25 `bd9f5e798fa3c6dd3b483ae6627796afb41c608d`，未复制固定角速度或实物标定参数。
+运行位置：Ubuntu aarch64 虚拟机 `/home/rm/robotmaster/07_armor_motion`。本轮没有训练、GitHub 推送或效果视频导出。参考版本为 TongjiSuperPower/sp_vision_25 `bd9f5e798fa3c6dd3b483ae6627796afb41c608d`，未复制固定角速度或实物标定参数。
 
 ## 集成范围
 

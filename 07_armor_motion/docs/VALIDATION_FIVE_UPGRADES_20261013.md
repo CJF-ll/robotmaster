@@ -1,6 +1,6 @@
 # 五项改造验证（2026-10-13）
 
-工程和运行均位于虚拟机 `/home/rm/robotmaster/outpost_motion`。本轮没有训练模型、提交 GitHub 或导出新效果视频；主程序使用 `--headless --no-video`。输入 `/home/rm/datasets/outpost/前哨站视频.mp4`，925 帧、668×688、30 fps，SHA256 为 `954081d075c01060df6608001f3991fb81126415daad3bdfe8402121d85809c0`。
+工程和运行均位于虚拟机 `/home/rm/robotmaster/07_armor_motion`。本轮没有训练模型、提交 GitHub 或导出新效果视频；主程序使用 `--headless --no-video`。输入 `/home/rm/datasets/outpost/前哨站视频.mp4`，925 帧、668×688、30 fps，SHA256 为 `954081d075c01060df6608001f3991fb81126415daad3bdfe8402121d85809c0`。
 
 参考工程版本 `TongjiSuperPower/sp_vision_25@bd9f5e798fa3c6dd3b483ae6627796afb41c608d`。本轮采用协方差信息参与估计、测量与预测可靠性分层和有界流水线思路，不复制固定角速度吸附、相机标定或实体尺寸。
 

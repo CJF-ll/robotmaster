@@ -1,5 +1,6 @@
-build/
-output/
-data/
-.DS_Store
-._*
+/build/
+/deps/
+/build-openvino/
+/build-openvino-2024/
+/outputs/
+*.mp4

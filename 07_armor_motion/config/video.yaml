@@ -1,153 +1,172 @@
-%YAML:1.0
-
-# affine: 无需相机内参，直接拟合圆周在图像中的投影椭圆。
-solver_mode: "affine"
-
-# 当前视频尺寸为 668x688，但没有对应相机的标定板数据，因此不伪造内参与畸变。
-# 完成这台相机的标定后填入 K、D，并把 camera_enabled 改为 1。
-camera_enabled: 0
-camera_reference_width: 668
-camera_reference_height: 688
-fx: 0.0
-fy: 0.0
-cx: 0.0
-cy: 0.0
-k1: 0.0
-k2: 0.0
-p1: 0.0
-p2: 0.0
-k3: 0.0
-
-# 实体参数统一放在 YAML。当前单目视频无法可靠反推出真实尺寸和俯角，因此用 0
-# 表示尚未实测；affine 模式不会使用这些数值。后续实测后直接替换即可。
-armor_width_m: 0.0
-armor_height_m: 0.0
-rotation_radius_m: 0.0
-# 绕相机 X 轴的右手角度，装甲板向下俯为负，单位为度。
-outpost_pitch_deg: 0.0
-
-# 当前视频的目标区域（归一化坐标）。
-roi_x_min: 0.20
-roi_y_min: 0.08
-roi_x_max: 0.82
-roi_y_max: 0.38
-
-# 红橙灯条检测。
-red_min: 72
-red_green_diff_min: 12
-red_blue_diff_min: 22
-min_light_area: 3.0
-max_light_area: 500.0
-min_light_length: 8.0
-max_light_length: 42.0
-min_light_ratio: 1.25
-max_light_tilt_deg: 42.0
-
-# 灯条配对。
-min_pair_distance_ratio: 1.15
-max_pair_distance_ratio: 3.4
-max_pair_y_diff_ratio: 0.65
-max_pair_length_ratio: 1.65
-max_pair_angle_diff_deg: 24.0
-
-# 观测四边形直接由两根灯带外缘构造；四项 padding 同时考虑比例和像素下限。
-quad_end_padding_ratio: 0.08
-quad_end_padding_min_px: 1.0
-quad_side_padding_ratio: 0.15
-quad_side_padding_min_px: 0.75
-quad_min_area_ratio: 0.45
-quad_min_opposite_edge_ratio: 0.45
-quad_max_opposite_edge_ratio: 2.20
-
-# 独立运行 outpost_calibrate，从标定视频的真实检测结果生成静态投影模型；
-# outpost_solver 只加载生成的模型并按时间顺序处理输入帧。
-geometry_calibration_stride: 1
-ellipse_ransac_iterations: 500
-ellipse_inlier_threshold: 0.16
-min_geometry_samples: 30
-
-# 从真实观测学习随旋转相位变化的中心残差和四边形角点。
-shape_phase_bins: 36
-shape_min_samples_per_bin: 3
-shape_min_covered_bins: 12
-shape_smoothing_radius_bins: 2
-model_offset_gain: 0.25
-model_offset_max_step_px: 8.0
-model_offset_max_magnitude_px: 20.0
-
-# 关联、速度变化平滑及速度物理上限。
-max_observation_distance_px: 55.0
-acceleration_gain: 0.08
-max_abs_speed_deg_s: 150.0
-
-# 跟踪生命周期与二维相位 Kalman 滤波。运行时只使用当前及历史观测；角速度
-# 由滤波器在线估计，不从完整输入视频注入周期或速度。时间阈值统一使用秒，
-# 因而不依赖 30/60 fps。phase_nis_gate 是一维相位创新的更新前门限。
-track_confirm_hits: 3
-track_confirm_max_gap_s: 0.12
-track_prediction_visible_s: 0.90
-track_lost_timeout_s: 1.50
-tracker_max_dt_s: 0.20
-phase_kf_measurement_std_deg: 10.0
-phase_kf_initial_phase_std_deg: 12.0
-phase_kf_initial_speed_std_deg_s: 90.0
-phase_kf_accel_noise_std_deg_s2: 300.0
-phase_nis_gate: 25.0
-association_pixel_sigma_px: 8.0
-association_score_weight: 0.25
-association_slot_switch_penalty: 0.20
-covariance_floor: 1.0e-9
-
-# 角速度大小由门控接受后的“显示目标切换循环”在线估计：连续 stride 次
-# 选择切换后，同一图像分支重复，对应三块等间距装甲的 120 度旋转；方向
-# 使用门控接受后的槽位编号变化做滑窗多数投票，不由首次跳变方向决定。
-# 参数只描述样本窗口和时间门限，不包含预设角速度、绝对帧号或轨迹。
-physical_speed_handover_stride: 3
-physical_speed_window: 5
-physical_direction_window: 15
-physical_speed_min_interval_s: 0.30
-physical_speed_max_interval_s: 3.00
-physical_speed_acceleration_gain: 0.20
-
-# 可选的匀速吸附。当前关闭且目标值为零，不参与运行时速度估计。
-angular_speed_snap_enabled: 0
-angular_speed_snap_rad_s: 0.0
-angular_speed_snap_tolerance_rad_s: 0.0
-
-# 绿色框表示本帧检测/模型位置，红色虚线框表示未来目标。默认提前 3 帧
-#（30 fps 时约 0.10 s）。若 prediction_lead_s 大于 0，程序将秒数按视频
-# FPS 量化到最近的完整帧，并同步回写有效帧数和秒数；否则使用配置的帧数
-# 并按视频 FPS 换算秒数。
-prediction_lead_frames: 3
-prediction_lead_s: 0.0
-prediction_max_acceleration_deg_s2: 300.0
-
-# 红框与绿色观测框重合时始终保留，只切换为较细的半透明虚线。进入和退出
-# 使用不同阈值形成迟滞，避免临界位置逐帧闪烁。
-prediction_overlap_enter_px: 6.0
-prediction_overlap_exit_px: 10.0
-prediction_overlap_enter_iou: 0.55
-prediction_overlap_exit_iou: 0.35
-prediction_overlap_alpha: 0.45
-
-# 同一块已检测装甲的短期位置由最近 5 个有效中心的 Theil-Sen 鲁棒直线
-# 拟合外推；周期性从左端跳回右端时重开窗口，不把交接当作巨大速度。
-# 状态相位门控与图像连续性门控相互独立：连续步长不超过 35 px；60--180 px
-# 只有在跳变方向与此前速度相反且跨过轨道中心时才视为换板。其余候选不写入
-# 速度历史，只在 timeout 内沿用此前可信速度。以下像素阈值对应 668x688 视频。
-image_prediction_window_frames: 5
-image_prediction_min_samples: 3
-image_prediction_velocity_gain: 1.0
-image_prediction_history_timeout_s: 0.15
-image_prediction_max_step_px: 35.0
-image_prediction_jump_min_px: 60.0
-image_prediction_jump_max_px: 180.0
-image_prediction_jump_direction_cos_max: -0.5
-
-stationary_speed_deg_s: 4.0
-uniform_acceleration_deg_s2: 28.0
-mode_hold_frames: 8
-
-# 相邻帧 ROI 差分用于判断机构当前是否运动。
-motion_difference_threshold: 0.80
-motion_hold_frames: 4
+schema_version: 1
+target_slots:
+  # Only image_2d uses this local-ID/profile resolver; 3D always has three physical slots.
+  enabled: true
+  count: 3
+  local_observations: 3
+  profile_samples: 120
+  sequence_transitions: 6
+  height_gate_lengths: 0.65
+  length_ratio: 1.8
+  angle_degrees: 35
+  ambiguity_margin: 0.2
+  reset_gap_seconds: 5
+visibility:
+  # Image-only diagnostics; never modifies the calibrated_3d physical state.
+  min_axial_overlap: 0.6
+  side_distance_ratio: 0.25
+  angle_degrees: 25
+  length_ratio: 2
+detector:
+  # Shared measurement geometry in both modes. Disabled thresholds may be stored live.
+  endpoint_refinement:
+    enabled: false
+    search_fraction: 0.35
+    min_contrast: 8.0
+    max_spread_px: 1.5
+  backend: traditional
+  thin_vertical_enabled: true
+  thin_min_pixels: 8
+  reject_border_contours: true
+  border_margin_px: 0
+  brightness: 130
+  red_difference: 35
+  min_area: 4
+  min_length: 5
+  max_length: 80
+  min_aspect: 1.8
+  max_tilt_deg: 40
+  max_length_ratio: 2
+  max_angle_diff_deg: 25
+  min_separation: 0.6
+  max_separation: 4
+  max_vertical_offset: 0.8
+  end_margin_ratio: 0.08
+  side_margin_ratio: 0.15
+  end_margin_min_px: 1
+  side_margin_min_px: 0.75
+  pairing_ambiguity_margin: 0.05
+input:
+  timestamp_file: "" # Optional CSV: frame,time_seconds; exact decoded-frame order.
+  prefetch_frames: 0 # 0 synchronous; 1..8 bounded decoder queue; no drops.
+  kind: video
+  path: /home/rm/datasets/outpost/前哨站视频.mp4
+display:
+  enabled: true
+prediction:
+  horizon_seconds: 0.10
+tracking:
+  # Causal confirmed-observation fit; no prerecorded trajectory or angular speed.
+  center_forecast:
+    enabled: true
+    samples: 9
+    min_span_seconds: 0.20
+    max_gap_seconds: 0.10
+    blend: 0.5
+  shape_guard:
+    enabled: false
+    max_drift_px: 3.0
+    history_samples: 4
+  # This section is used only by image_2d; inactive values remain strictly validated.
+  common_endpoint_guard:
+    enabled: false
+    shrink_ratio: 0.75
+    width_tolerance: 0.10
+    max_gap_seconds: 0.10
+    min_hits: 5
+  measurement_quality:
+    enabled: false
+    max_variance_scale: 4.0
+  clean_recovery:
+    enabled: false
+    max_gap_seconds: 0.10
+    max_nis: 4.0
+    hits: 2
+  one_sided_guard:
+    enabled: false
+    shrink_ratio: 0.7
+    other_side_tolerance: 0.1
+    min_hits: 5
+  # Advisory diagnostics only; never hides or accepts a prediction.
+  health:
+    window_seconds: 0.5
+    min_samples: 8
+    nis_warning: 5.991464547
+    failure_fraction: 0.4
+  low_resolution_noise_scale: 1.0
+  coast_seconds: 0.30
+  acceleration_noise: 25000
+  measurement_noise: 4
+  initial_velocity_variance: 10000
+  association_pixels: 30
+  innovation_gate: 13.82
+  max_shape_ratio: 2.5
+  max_position_std: 20
+  association_angle_degrees: 30
+  association_length_ratio: 2
+  ambiguity_margin: 1
+  association_miss_cost: 15
+  confirmation_hits: 3
+  prediction_hits: 5
+geometry:
+  # Raw image_2d does not consume K/D or physical dimensions.
+  # undistort uses K/D; calibrated_3d additionally requires measured lamp/axis geometry.
+  # armor_width_m / armor_height_m are retained metadata, not lightbar geometry.
+  undistort: false
+  calibration_width: 0
+  calibration_height: 0
+  allow_uniform_resize: false
+  mode: image_2d
+  # Unknown calibration stays null, never replaced with demo values.
+  camera_matrix: null
+  distortion: null
+  armor_width_m: null
+  armor_height_m: null
+  # Physical board dimensions above; centerline endpoint geometry below.
+  lightbar_length_m: null
+  lightbar_center_distance_m: null
+  rotation_radius_m: null
+  armor_pitch_deg: null
+  slot_height_offsets_m: null
+  camera_from_target_rotation: null
+rigid_estimator:
+  covariance_estimation_enabled: true
+  association_nis_scale: 18.47 # Soft ranking scale, not a hard innovation cutoff.
+  robust_fit_gate_std: 3.0
+  # Only calibrated_3d uses these settings. Noise values are model assumptions.
+  pose_refinement_iterations: 20
+  pixel_noise_std_px: 0.5
+  min_geometry_information_ratio: 1.0e-8
+  max_center_std_m: 0.15
+  max_phase_std_rad: 0.35
+  translation_acceleration_std_m_s2: 1.0
+  angular_acceleration_std_rad_s2: 4.0
+  max_future_corner_std_px: 20.0
+  adaptive_window_enabled: true
+  motion_change_threshold_rad: 0.025
+  motion_change_threshold_m: 0.008
+  motion_change_confirmations: 3
+  history_seconds: 0.30
+  min_history_seconds: 0.10
+  coast_seconds: 0.30
+  min_samples: 5
+  max_reprojection_error_px: 2.5
+  max_orientation_error_rad: 0.30
+  max_center_error_m: 0.10
+  max_phase_error_rad: 0.65
+  # Bounds reject implausible fits; they never set the estimated speed.
+  max_angular_speed_rad_s: 20
+  max_center_speed_m_s: 10
+  min_quad_area_px: 8
+  identity_score_margin: 4
+  pose_ambiguity_margin: 0.20
+  max_fit_center_rms_m: 0.03
+  max_fit_phase_rms_rad: 0.12
+camera:
+  enabled: false
+control:
+  enabled: false
+ballistics:
+  enabled: false
+rule_speed_prior:
+  enabled: false
